@@ -488,6 +488,209 @@ async def import_manual(listing: dict):
 
 
 # ---------------------------------------------------------------------------
+# Screenshot OCR endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/api/import/screenshot")
+async def import_screenshot(file: UploadFile = File(...)):
+    allowed_types = ["image/jpeg", "image/png", "image/webp", "image/jpg"]
+    if file.content_type and file.content_type not in allowed_types:
+        ext = file.filename.split(".")[-1].lower() if file.filename else ""
+        if ext not in ("jpg", "jpeg", "png", "webp"):
+            raise HTTPException(status_code=400, detail="File must be JPEG, PNG, or WebP image")
+
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large (max 20MB)")
+
+    mime = file.content_type or "image/jpeg"
+
+    from scrapers.ocr import extract_from_screenshot
+    extracted = await extract_from_screenshot(content, mime)
+
+    if extracted.get("error"):
+        raise HTTPException(status_code=422, detail=extracted["error"])
+
+    if not extracted.get("title"):
+        raise HTTPException(status_code=422, detail="Could not extract listing data from screenshot. Try a clearer image.")
+
+    source = extracted.pop("source", "screenshot")
+    result = process_and_store_listing(extracted, source)
+
+    if not result:
+        raise HTTPException(status_code=400, detail="Could not store listing (missing title or duplicate)")
+
+    import_runs_col.insert_one({
+        "source": source,
+        "filename": file.filename,
+        "count": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    stored = listings_col.find_one({"_id": ObjectId(result)}, {"_id": 0})
+    return {
+        "success": True,
+        "listing_id": result,
+        "extracted": extracted,
+        "score": stored.get("score") if stored else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Craigslist scraper endpoint
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel
+
+class CraigslistScrapeRequest(BaseModel):
+    city: str = "austin"
+    query: str = ""
+    category: str = "all"
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    search_distance: Optional[int] = None
+    max_results: int = 50
+    fetch_details: bool = False
+
+
+@app.post("/api/scrape/craigslist")
+def scrape_craigslist_endpoint(req: CraigslistScrapeRequest):
+    from scrapers.craigslist import scrape_craigslist as do_scrape
+
+    result = do_scrape(
+        city=req.city,
+        query=req.query,
+        category=req.category,
+        min_price=req.min_price,
+        max_price=req.max_price,
+        search_distance=req.search_distance,
+        max_results=req.max_results,
+        fetch_details=req.fetch_details,
+    )
+
+    if result["error"]:
+        return {
+            "success": False,
+            "error": result["error"],
+            "source_url": result["source_url"],
+            "imported": 0,
+            "total_found": 0,
+        }
+
+    imported = 0
+    skipped = 0
+    for listing in result["listings"]:
+        res = process_and_store_listing(listing, "craigslist")
+        if res:
+            imported += 1
+        else:
+            skipped += 1
+
+    import_runs_col.insert_one({
+        "source": "craigslist",
+        "city": req.city,
+        "query": req.query,
+        "count": imported,
+        "skipped": skipped,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    return {
+        "success": True,
+        "imported": imported,
+        "skipped": skipped,
+        "total_found": result["total_found"],
+        "source_url": result["source_url"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# GovPlanet scraper endpoint
+# ---------------------------------------------------------------------------
+
+class GovPlanetScrapeRequest(BaseModel):
+    query: str = ""
+    category: str = "all"
+    max_price: Optional[float] = None
+    max_results: int = 50
+
+
+@app.post("/api/scrape/govplanet")
+def scrape_govplanet_endpoint(req: GovPlanetScrapeRequest):
+    from scrapers.govplanet import scrape_govplanet as do_scrape
+
+    result = do_scrape(
+        query=req.query,
+        category=req.category,
+        max_price=req.max_price,
+        max_results=req.max_results,
+    )
+
+    if result["error"]:
+        return {
+            "success": False,
+            "error": result["error"],
+            "source_url": result["source_url"],
+            "imported": 0,
+            "total_found": 0,
+        }
+
+    imported = 0
+    skipped = 0
+    for listing in result["listings"]:
+        res = process_and_store_listing(listing, "govplanet")
+        if res:
+            imported += 1
+        else:
+            skipped += 1
+
+    import_runs_col.insert_one({
+        "source": "govplanet",
+        "query": req.query,
+        "count": imported,
+        "skipped": skipped,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    return {
+        "success": True,
+        "imported": imported,
+        "skipped": skipped,
+        "total_found": result["total_found"],
+        "source_url": result["source_url"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Available scraper sources info
+# ---------------------------------------------------------------------------
+
+@app.get("/api/scrapers")
+def get_scrapers():
+    from scrapers.craigslist import CL_CITIES, CL_CATEGORIES
+    from scrapers.govplanet import GP_CATEGORIES
+    return {
+        "craigslist": {
+            "name": "Craigslist",
+            "status": "available",
+            "cities": list(CL_CITIES.keys()),
+            "categories": list(CL_CATEGORIES.keys()),
+        },
+        "govplanet": {
+            "name": "GovPlanet",
+            "status": "available",
+            "categories": list(GP_CATEGORIES.keys()),
+        },
+        "screenshot_ocr": {
+            "name": "Screenshot OCR",
+            "status": "available",
+            "supported_formats": ["JPEG", "PNG", "WebP"],
+            "vision_model": "GPT-4o (primary) + Tesseract (fallback)",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Seed data
 # ---------------------------------------------------------------------------
 

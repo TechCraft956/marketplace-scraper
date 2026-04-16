@@ -5,7 +5,7 @@ import {
   Lightning, TrendUp, Package, Car, Wrench, Desktop,
   Couch, ArrowsClockwise, X, Fire, WarningCircle,
   Plus, FileArrowUp, DownloadSimple, SortAscending, SortDescending,
-  MapPin, Clock, Tag, Eye, CaretRight
+  MapPin, Clock, Tag, Eye, CaretRight, Camera, Globe, GlobeHemisphereWest
 } from '@phosphor-icons/react';
 import './App.css';
 
@@ -302,7 +302,8 @@ function ImportPanel({ onImportDone }) {
     setImporting(true);
     setResult(null);
     const ext = file.name.split('.').pop().toLowerCase();
-    const endpoint = ext === 'csv' ? '/api/import/csv' : '/api/import/json';
+    const isImage = ['jpg', 'jpeg', 'png', 'webp'].includes(ext);
+    const endpoint = isImage ? '/api/import/screenshot' : ext === 'csv' ? '/api/import/csv' : '/api/import/json';
     const form = new FormData();
     form.append('file', file);
     try {
@@ -338,7 +339,7 @@ function ImportPanel({ onImportDone }) {
         <input
           ref={fileRef}
           type="file"
-          accept=".csv,.json"
+          accept=".csv,.json,.jpg,.jpeg,.png,.webp"
           className="hidden"
           data-testid="import-file-input"
           onChange={(e) => handleFile(e.target.files[0])}
@@ -351,14 +352,134 @@ function ImportPanel({ onImportDone }) {
         ) : (
           <div className="flex flex-col items-center gap-2">
             <FileArrowUp size={24} className="text-zinc-500" />
-            <span className="text-xs text-zinc-400">Drop CSV or JSON file</span>
-            <span className="text-[10px] text-zinc-600">or click to browse</span>
+            <span className="text-xs text-zinc-400">Drop CSV, JSON, or Screenshot</span>
+            <span className="text-[10px] text-zinc-600">CSV / JSON / JPG / PNG / WebP</span>
           </div>
         )}
       </div>
       {result && (
         <div className={`mt-2 text-xs p-2 rounded-sm ${result.success ? 'bg-emerald-400/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
-          {result.success ? `Imported ${result.imported} listings (${result.skipped} skipped)` : result.error}
+          {result.success
+            ? result.imported != null
+              ? `Imported ${result.imported} listings${result.skipped ? ` (${result.skipped} skipped)` : ''}`
+              : `Extracted: ${result.extracted?.title || 'listing'} — Score: ${result.score ?? '?'}`
+            : result.error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScraperPanel({ onImportDone }) {
+  const [activeTab, setActiveTab] = useState('craigslist');
+  const [scraping, setScraping] = useState(false);
+  const [result, setResult] = useState(null);
+
+  // Craigslist form
+  const [clCity, setClCity] = useState('austin');
+  const [clQuery, setClQuery] = useState('');
+  const [clCategory, setClCategory] = useState('all');
+  const [clMaxPrice, setClMaxPrice] = useState('');
+
+  // GovPlanet form
+  const [gpQuery, setGpQuery] = useState('');
+  const [gpCategory, setGpCategory] = useState('all');
+  const [gpMaxPrice, setGpMaxPrice] = useState('');
+
+  const CL_CITIES = ['austin', 'houston', 'dallas', 'san-antonio', 'phoenix', 'denver', 'seattle', 'atlanta', 'chicago', 'los-angeles', 'new-york', 'portland', 'miami', 'tampa', 'nashville'];
+  const CL_CATS = ['all', 'vehicles', 'motorcycles', 'electronics', 'furniture', 'tools', 'heavy_equipment', 'trailers', 'free'];
+  const GP_CATS = ['all', 'construction', 'trucks', 'vehicles', 'trailers', 'agriculture', 'heavy_equipment'];
+
+  const handleScrape = async () => {
+    setScraping(true);
+    setResult(null);
+    try {
+      let endpoint, body;
+      if (activeTab === 'craigslist') {
+        endpoint = '/api/scrape/craigslist';
+        body = { city: clCity, query: clQuery, category: clCategory, max_price: clMaxPrice ? Number(clMaxPrice) : null, max_results: 50 };
+      } else {
+        endpoint = '/api/scrape/govplanet';
+        body = { query: gpQuery, category: gpCategory, max_price: gpMaxPrice ? Number(gpMaxPrice) : null, max_results: 50 };
+      }
+      const res = await fetch(`${API}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      setResult(data);
+      if (data.imported > 0) onImportDone();
+    } catch (err) {
+      setResult({ success: false, error: err.message });
+    } finally {
+      setScraping(false);
+    }
+  };
+
+  return (
+    <div data-testid="scraper-panel" className="bg-[#18181B] border border-zinc-800 rounded-sm p-4">
+      <h3 className="text-[10px] uppercase tracking-[0.2em] text-zinc-400 font-medium mb-3">WEB SCRAPERS</h3>
+
+      {/* Tabs */}
+      <div className="flex space-x-1 bg-zinc-950 p-1 rounded-sm border border-zinc-800 mb-3">
+        <button
+          data-testid="scraper-tab-craigslist"
+          onClick={() => { setActiveTab('craigslist'); setResult(null); }}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-sm text-[11px] font-medium flex-1 justify-center transition-colors ${activeTab === 'craigslist' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}
+        >
+          <Globe size={12} /> Craigslist
+        </button>
+        <button
+          data-testid="scraper-tab-govplanet"
+          onClick={() => { setActiveTab('govplanet'); setResult(null); }}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-sm text-[11px] font-medium flex-1 justify-center transition-colors ${activeTab === 'govplanet' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}
+        >
+          <GlobeHemisphereWest size={12} /> GovPlanet
+        </button>
+      </div>
+
+      {/* Craigslist form */}
+      {activeTab === 'craigslist' && (
+        <div className="space-y-2">
+          <div className="grid grid-cols-2 gap-2">
+            <select data-testid="cl-city-select" value={clCity} onChange={e => setClCity(e.target.value)} className="px-2 py-1.5 rounded-sm text-xs bg-zinc-950 border border-zinc-800 text-zinc-300 focus:outline-none focus:border-blue-500/50">
+              {CL_CITIES.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <select data-testid="cl-category-select" value={clCategory} onChange={e => setClCategory(e.target.value)} className="px-2 py-1.5 rounded-sm text-xs bg-zinc-950 border border-zinc-800 text-zinc-300 focus:outline-none focus:border-blue-500/50">
+              {CL_CATS.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <input data-testid="cl-query-input" type="text" placeholder="Search (e.g. F-150, excavator)" value={clQuery} onChange={e => setClQuery(e.target.value)} className="w-full px-2 py-1.5 rounded-sm text-xs bg-zinc-950 border border-zinc-800 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500/50" />
+          <input data-testid="cl-max-price" type="number" placeholder="Max price" value={clMaxPrice} onChange={e => setClMaxPrice(e.target.value)} className="w-full px-2 py-1.5 rounded-sm text-xs bg-zinc-950 border border-zinc-800 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500/50" />
+        </div>
+      )}
+
+      {/* GovPlanet form */}
+      {activeTab === 'govplanet' && (
+        <div className="space-y-2">
+          <select data-testid="gp-category-select" value={gpCategory} onChange={e => setGpCategory(e.target.value)} className="w-full px-2 py-1.5 rounded-sm text-xs bg-zinc-950 border border-zinc-800 text-zinc-300 focus:outline-none focus:border-blue-500/50">
+            {GP_CATS.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <input data-testid="gp-query-input" type="text" placeholder="Search (e.g. backhoe, forklift)" value={gpQuery} onChange={e => setGpQuery(e.target.value)} className="w-full px-2 py-1.5 rounded-sm text-xs bg-zinc-950 border border-zinc-800 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500/50" />
+          <input data-testid="gp-max-price" type="number" placeholder="Max price" value={gpMaxPrice} onChange={e => setGpMaxPrice(e.target.value)} className="w-full px-2 py-1.5 rounded-sm text-xs bg-zinc-950 border border-zinc-800 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500/50" />
+        </div>
+      )}
+
+      <button
+        data-testid="scrape-btn"
+        onClick={handleScrape}
+        disabled={scraping}
+        className="w-full mt-3 flex items-center justify-center gap-1.5 px-3 py-2 rounded-sm text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+      >
+        {scraping ? <><ArrowsClockwise size={14} className="animate-spin" /> Scraping...</> : <><MagnifyingGlass size={14} /> Scrape Now</>}
+      </button>
+
+      {result && (
+        <div className={`mt-2 text-xs p-2 rounded-sm ${result.success ? 'bg-emerald-400/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
+          {result.success
+            ? `Found ${result.total_found} listings, imported ${result.imported} new${result.skipped ? ` (${result.skipped} dupes)` : ''}`
+            : result.error || 'Scrape failed'}
         </div>
       )}
     </div>
@@ -627,6 +748,7 @@ export default function App() {
             <ScoreDistribution stats={stats} />
             <CategoryBreakdown stats={stats} />
             <ImportPanel onImportDone={handleImportDone} />
+            <ScraperPanel onImportDone={handleImportDone} />
 
             {/* Last import info */}
             {stats?.last_import && (
