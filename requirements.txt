@@ -1,0 +1,19 @@
+# Facebook Marketplace Scraper Module — Python Dependencies
+# Install with: pip install -r requirements.txt --break-system-packages
+# Then: playwright install chromium
+
+# ---- Browser automation ----
+playwright>=1.43.0
+
+# ---- Async I/O ----
+aiosqlite>=0.20.0
+
+# ---- Data validation ----
+pydantic>=2.0.0
+
+# ---- Typing backports (for Python 3.9 compat) ----
+typing_extensions>=4.0.0
+
+# ---- Utilities ----
+# (Standard library modules used: asyncio, json, logging, re, pathlib,
+#  datetime, random, urllib.parse — no additional installs needed)
