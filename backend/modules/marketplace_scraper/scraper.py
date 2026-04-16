@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote_plus, urlencode
 
+logger = logging.getLogger(__name__)
+
 try:
     from playwright.async_api import (
         Browser,
@@ -30,12 +32,13 @@ try:
         async_playwright,
         TimeoutError as PlaywrightTimeout,
     )
+    PLAYWRIGHT_AVAILABLE = True
 except ImportError:
-    raise ImportError(
-        "playwright is required: pip install playwright && playwright install chromium"
-    )
-
-logger = logging.getLogger(__name__)
+    PLAYWRIGHT_AVAILABLE = False
+    Browser = BrowserContext = Page = Playwright = None
+    PlaywrightTimeout = TimeoutError
+    async_playwright = None
+    logger.warning("playwright not installed — scraper module disabled")
 
 # ---------------------------------------------------------------------------
 # Data structures
