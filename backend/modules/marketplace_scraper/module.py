@@ -23,6 +23,17 @@ from .storage import MarketplaceStorage
 
 logger = logging.getLogger(__name__)
 
+# Optional shared-feed integration — fails silently if not present
+import sys as _sys
+from pathlib import Path as _Path
+_feed_dir = _Path(__file__).parents[4] / "shared-feed"
+if str(_feed_dir) not in _sys.path:
+    _sys.path.insert(0, str(_feed_dir))
+try:
+    from feed import write_app_status as _write_feed
+except ImportError:
+    _write_feed = None
+
 
 # ---------------------------------------------------------------------------
 # BaseModule interface (mirrors backend/modules/base.py in the host dashboard)
@@ -222,10 +233,26 @@ class MarketplaceScraperModule:
                 "completed_at": self._last_scrape_at.isoformat(),
             }
             logger.info("Scrape cycle complete: %s", summary)
+            if _write_feed:
+                _write_feed(
+                    app_id="marketplace_scraper",
+                    app_name="Marketplace Scraper",
+                    status="idle",
+                    metrics={"new_listings": new_count, "total_filtered": total_after_filter, "total_scraped": total_scraped},
+                    recent_events=[f"Scan complete — {new_count} new, {total_after_filter} passed filters"],
+                    actions=["run_scan", "open_results"],
+                )
             return summary
 
         except Exception as exc:
             logger.error("Scrape cycle failed: %s", exc, exc_info=True)
+            if _write_feed:
+                _write_feed(
+                    app_id="marketplace_scraper",
+                    app_name="Marketplace Scraper",
+                    status="error",
+                    recent_events=[f"Scrape failed: {str(exc)[:120]}"],
+                )
             if run_id is not None:
                 await self.storage.complete_run(
                     run_id=run_id,
