@@ -1,12 +1,16 @@
 """
 ResaleScorer — Deal potential scoring for Facebook Marketplace listings.
 
-Scores each listing 0-100 based on:
+Scores each listing 0-150 based on:
   - Price vs. category median (up to 40 pts)
   - Urgency keywords (up to 20 pts)
   - Listing recency (up to 15 pts)
   - Image count / legitimacy (up to 10 pts)
   - Distance from user (up to 15 pts)
+  - Category weight bonus/penalty
+  - Profit boost
+  - Geo distance penalty
+  - Practicality boost
 
 Returns a score + detailed breakdown dict per listing.
 """
@@ -19,6 +23,18 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+try:
+    from geo import score_geo as _score_geo
+except ImportError:
+    def _score_geo(listing):
+        return {
+            "distance_miles": None,
+            "travel_tier": "unknown",
+            "distance_penalty": 0,
+            "effective_profit_after_travel": None,
+            "geocoded": False,
+        }
 
 # ---------------------------------------------------------------------------
 # Category price reference table
@@ -369,6 +385,28 @@ def estimate_profit(price: float, category: str, title: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Practicality layer
+# ---------------------------------------------------------------------------
+
+HIGH_RESALE = frozenset({
+    "vehicle", "motorcycle", "truck", "equipment", "tool", "lathe",
+    "generator", "compressor", "welder", "trailer", "rv", "boat",
+})
+LOW_RESALE = frozenset({
+    "junk", "random", "stuff", "lot", "misc", "bundle", "box of", "bag of", "pile",
+})
+
+
+def practicality_score(listing: dict) -> int:
+    title = (listing.get("title") or "").lower()
+    if any(w in title for w in HIGH_RESALE):
+        return 10
+    if any(w in title for w in LOW_RESALE):
+        return -15
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Score result dataclass
 # ---------------------------------------------------------------------------
 
@@ -393,6 +431,14 @@ class ScoreBreakdown:
     category_weight: int = 0
     urgency_matched: list = field(default_factory=list)
     profit_boost: int = 0
+    # Geo fields
+    distance_miles: Optional[float] = None
+    travel_tier: str = "unknown"
+    distance_penalty: int = 0
+    effective_profit_after_travel: Optional[float] = None
+    geocoded: bool = False
+    # Practicality
+    practicality_boost: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -419,6 +465,16 @@ class ScoreBreakdown:
             "category_weight": self.category_weight,
             "urgency_matched": self.urgency_matched,
             "profit_boost": self.profit_boost,
+            "distance_miles": self.distance_miles,
+            "travel_tier": self.travel_tier,
+            "distance_penalty": self.distance_penalty,
+            "effective_profit_after_travel": (
+                round(self.effective_profit_after_travel, 2)
+                if self.effective_profit_after_travel is not None
+                else None
+            ),
+            "geocoded": self.geocoded,
+            "practicality_boost": self.practicality_boost,
         }
 
 
@@ -431,7 +487,7 @@ class ResaleScorer:
     Score a normalized listing dict for deal/resale potential.
 
     Example:
-        scorer = ResaleScorer(user_zip="78701", max_acceptable_distance=40)
+        scorer = ResaleScorer(user_zip="78584", max_acceptable_distance=40)
         result = scorer.score(listing)
         print(result.score)           # e.g. 78.5
         print(result.to_dict())       # full breakdown
@@ -445,7 +501,7 @@ class ResaleScorer:
     ) -> None:
         self.user_zip = user_zip
         self.max_acceptable_distance = max_acceptable_distance
-        self.price_weight = price_weight  # Multiplier for price scoring (1.0 = default)
+        self.price_weight = price_weight
 
     def score(self, listing: dict[str, Any]) -> ScoreBreakdown:
         """
@@ -497,6 +553,14 @@ class ResaleScorer:
         profit_data = estimate_profit(price or 0.0, category or "", title)
         conf = confidence_score(listing)
 
+        # ---- Geo scoring ----
+        _listing_for_geo = dict(listing)
+        _listing_for_geo["estimated_profit_low"] = profit_data["estimated_profit_low"]
+        geo = _score_geo(_listing_for_geo)
+
+        # ---- Practicality ----
+        prac_boost = practicality_score(listing)
+
         # ---- Total ----
         base_score = (
             price_score
@@ -505,7 +569,13 @@ class ResaleScorer:
             + image_score
             + distance_score
         )
-        total = base_score + cat_weight + profit_data["profit_boost"]
+        total = (
+            base_score
+            + cat_weight
+            + profit_data["profit_boost"]
+            + geo["distance_penalty"]   # negative, naturally reduces score
+            + prac_boost
+        )
         total = max(0.0, min(150.0, total))
 
         explanation = self._build_explanation(
@@ -541,6 +611,12 @@ class ResaleScorer:
             category_weight=cat_weight,
             urgency_matched=matched_keywords,
             profit_boost=profit_data["profit_boost"],
+            distance_miles=geo["distance_miles"],
+            travel_tier=geo["travel_tier"],
+            distance_penalty=geo["distance_penalty"],
+            effective_profit_after_travel=geo["effective_profit_after_travel"],
+            geocoded=geo["geocoded"],
+            practicality_boost=prac_boost,
         )
 
     # ------------------------------------------------------------------

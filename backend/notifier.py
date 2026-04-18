@@ -23,11 +23,52 @@ ALERT_SCORE_THRESHOLD: float = float(os.environ.get("ALERT_SCORE_THRESHOLD", "70
 STORAGE_PATH: Path = Path(os.environ.get("STORAGE_PATH", "/app/storage"))
 ALERTED_IDS_FILE: Path = STORAGE_PATH / "alerted_ids.json"
 
+
+def _get(listing: dict, field: str, default=None):
+    """Read a field from listing top level or fall back to score_breakdown."""
+    v = listing.get(field)
+    if v is None:
+        v = (listing.get("score_breakdown") or {}).get(field, default)
+    return v if v is not None else default
+
+
 def is_opportunity(listing: dict) -> bool:
-    """Return True if listing meets alert criteria: score >= threshold and confidence >= 0.6."""
+    """Return True if listing meets alert criteria based on score, confidence, and travel tier."""
     score = listing.get("score") or 0
-    confidence = listing.get("confidence", 0.7)
-    return score >= ALERT_SCORE_THRESHOLD and confidence >= 0.6
+    confidence = _get(listing, "confidence", 0.7)
+    travel_tier = _get(listing, "travel_tier", "unknown")
+    profit_low = _get(listing, "estimated_profit_low") or 0
+    category = (listing.get("category") or "").lower()
+
+    if score < ALERT_SCORE_THRESHOLD or confidence < 0.6:
+        return False
+
+    if travel_tier == "local":
+        return True
+    elif travel_tier == "stretch":
+        return profit_low >= 500
+    elif travel_tier == "far":
+        far_profit_ok = profit_low >= float(os.environ.get("FAR_OVERRIDE_PROFIT", "2500"))
+        far_cat_ok = any(c in category for c in ["equipment", "vehicle", "motorcycle", "truck", "heavy"])
+        return far_profit_ok and far_cat_ok
+    else:  # unknown distance
+        return score >= 75
+
+
+def alert_reason(listing: dict) -> str:
+    """Return a human-readable string explaining why this listing qualifies."""
+    travel_tier = _get(listing, "travel_tier", "unknown")
+    score = listing.get("score") or 0
+    profit_low = _get(listing, "estimated_profit_low") or 0
+
+    if travel_tier == "local":
+        return "local high-confidence flip" if score >= 80 else "local deal"
+    elif travel_tier == "stretch":
+        return "stretch zone — strong margin" if profit_low >= 1000 else "stretch zone — acceptable margin"
+    elif travel_tier == "far":
+        return "far distance overridden by exceptional profit"
+    else:
+        return "unknown location — high score"
 
 
 def _load_alerted_ids() -> set:
@@ -47,7 +88,7 @@ def _save_alerted_ids(ids: set) -> None:
 
 
 def format_alert(listing: dict) -> str:
-    """Format listing as a Telegram HTML message."""
+    """Format listing as a Telegram HTML message with geo context."""
     score = listing.get("score") or 0
     title = listing.get("title", "Unknown")
     price = listing.get("price")
@@ -58,19 +99,36 @@ def format_alert(listing: dict) -> str:
     keywords = breakdown.get("matched_keywords") or listing.get("keywords") or []
     explanation = breakdown.get("explanation", "")
 
+    travel_tier = _get(listing, "travel_tier", "unknown")
+    distance_miles = _get(listing, "distance_miles")
+    effective_profit = _get(listing, "effective_profit_after_travel")
+    reason = alert_reason(listing)
+
+    tier_emoji = {
+        "local": "🟢",
+        "stretch": "🟡",
+        "far": "🔴",
+    }.get(travel_tier, "⚪")
+
     if keywords:
-        reason = f"Keywords: {', '.join(keywords)}"
+        deal_signal = f"Keywords: {', '.join(keywords)}"
     elif explanation:
-        reason = explanation.split(".")[0]
+        deal_signal = explanation.split(".")[0]
     else:
-        reason = "High deal score"
+        deal_signal = "High deal score"
 
     lines = [
-        f"🔥 <b>Deal Alert — Score {score:.0f}/100</b>",
+        f"🔥 <b>Deal Alert — Score {score:.0f}/150</b>",
         f"<b>{title}</b>",
         f"💰 {price_str}",
-        f"📊 {reason}",
+        f"{tier_emoji} {travel_tier.capitalize()} — {reason}",
+        f"📊 {deal_signal}",
     ]
+    if distance_miles is not None:
+        lines.append(f"📍 {distance_miles:.0f} miles away")
+    if effective_profit is not None:
+        profit_str = f"${effective_profit:,.0f}" if effective_profit >= 0 else f"-${abs(effective_profit):,.0f}"
+        lines.append(f"💵 Profit after travel: {profit_str}")
     if url:
         lines.append(f'🔗 <a href="{url}">View Listing</a>')
     return "\n".join(lines)

@@ -2,6 +2,7 @@
 DealScope — Marketplace Deal Intelligence API
 FastAPI backend with MongoDB storage, scoring engine, and multi-source ingestion.
 """
+import asyncio
 import os
 import csv
 import json
@@ -10,7 +11,10 @@ import re
 import hashlib
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
+
+import notifier
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -43,12 +47,28 @@ client = MongoClient(MONGO_URL)
 db = client[DB_NAME]
 listings_col = db["listings"]
 import_runs_col = db["import_runs"]
+scored_opportunities_col = db["scored_opportunities"]
 
 # Ensure indexes
 listings_col.create_index([("score", DESCENDING)])
 listings_col.create_index("listing_hash", unique=True, sparse=True)
 listings_col.create_index("category")
 listings_col.create_index("is_sold")
+scored_opportunities_col.create_index([("score", DESCENDING)])
+scored_opportunities_col.create_index("listing_id", unique=True, sparse=True)
+
+SCORED_JSON_PATH = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "scored.json"
+SCRAPE_LOG_PATH  = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "scrape_log.json"
+FB_COOKIES_PATH  = Path(os.environ.get("FB_COOKIES_PATH", "/app/cookies/fb_cookies.json"))
+
+# Per-source scheduler state (mutated by background tasks at runtime)
+SCHEDULER_STATUS: dict = {
+    "craigslist":    {"interval_minutes": 30, "last_run": None, "next_run": None, "last_imported": 0, "last_error": None, "running": False},
+    "govplanet":     {"interval_minutes": 60, "last_run": None, "next_run": None, "last_imported": 0, "last_error": None, "running": False},
+    "publicsurplus": {"interval_minutes": 60, "last_run": None, "next_run": None, "last_imported": 0, "last_error": None, "running": False},
+    "facebook":      {"interval_minutes": 45, "last_run": None, "next_run": None, "last_imported": 0, "last_error": None, "running": False},
+    "ebay":          {"interval_minutes": 60, "last_run": None, "next_run": None, "last_imported": 0, "last_error": None, "running": False},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +205,21 @@ def score_listing(listing: dict) -> dict:
 def serialize_listing(doc: dict) -> dict:
     doc["id"] = str(doc.pop("_id"))
     return doc
+
+
+def _upsert_opportunity(listing: dict, listing_id: str) -> None:
+    doc = {k: v for k, v in listing.items() if k != "_id"}
+    doc["listing_id"] = listing_id
+    scored_opportunities_col.replace_one({"listing_id": listing_id}, doc, upsert=True)
+
+
+def _write_scored_json(results: list) -> None:
+    try:
+        SCORED_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(SCORED_JSON_PATH, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+    except Exception as e:
+        logger.warning("Could not write scored.json: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -387,10 +422,21 @@ def process_and_store_listing(raw: dict, source: str) -> Optional[str]:
 
     breakdown = score_listing(listing_data)
     listing_data["score"] = breakdown["score"]
+    listing_data["confidence"] = breakdown.get("confidence")
+    listing_data["estimated_profit_low"] = breakdown.get("estimated_profit_low")
+    listing_data["travel_tier"] = breakdown.get("travel_tier", "unknown")
+    listing_data["distance_miles"] = breakdown.get("distance_miles")
+    listing_data["effective_profit_after_travel"] = breakdown.get("effective_profit_after_travel")
     listing_data["score_breakdown"] = breakdown
 
     result = listings_col.insert_one(listing_data)
-    return str(result.inserted_id)
+    new_id = str(result.inserted_id)
+
+    if notifier.is_opportunity(listing_data):
+        _upsert_opportunity(listing_data, new_id)
+        notifier.maybe_alert(listing_data, new_id)
+
+    return new_id
 
 
 def parse_price_str(s: str) -> Optional[float]:
@@ -542,8 +588,11 @@ async def import_screenshot(file: UploadFile = File(...)):
 
 from pydantic import BaseModel
 
+CRAIGSLIST_LOCATION = os.environ.get("CRAIGSLIST_LOCATION", "sfbay")
+
+
 class CraigslistScrapeRequest(BaseModel):
-    city: str = "austin"
+    city: Optional[str] = None   # falls back to CRAIGSLIST_LOCATION env var
     query: str = ""
     category: str = "all"
     min_price: Optional[float] = None
@@ -557,8 +606,10 @@ class CraigslistScrapeRequest(BaseModel):
 def scrape_craigslist_endpoint(req: CraigslistScrapeRequest):
     from scrapers.craigslist import scrape_craigslist as do_scrape
 
+    city = req.city or CRAIGSLIST_LOCATION
+
     result = do_scrape(
-        city=req.city,
+        city=city,
         query=req.query,
         category=req.category,
         min_price=req.min_price,
@@ -669,25 +720,343 @@ def scrape_govplanet_endpoint(req: GovPlanetScrapeRequest):
 def get_scrapers():
     from scrapers.craigslist import CL_CITIES, CL_CATEGORIES
     from scrapers.govplanet import GP_CATEGORIES
+    from scrapers.ebay import EBAY_CATEGORIES, EBAY_APP_ID
+    from scrapers.craigslist_rss import CL_CATEGORIES_RSS
+    from scrapers.publicsurplus import PS_CATEGORIES
     return {
         "craigslist": {
-            "name": "Craigslist",
+            "name": "Craigslist HTML",
             "status": "available",
+            "endpoint": "POST /api/scrape/craigslist",
             "cities": list(CL_CITIES.keys()),
             "categories": list(CL_CATEGORIES.keys()),
+        },
+        "craigslist_rss": {
+            "name": "Craigslist RSS",
+            "status": "available",
+            "endpoint": "POST /api/scrape/craigslist-rss",
+            "note": "Faster than HTML, stdlib only, no extra deps",
+            "categories": list(CL_CATEGORIES_RSS.keys()),
         },
         "govplanet": {
             "name": "GovPlanet",
             "status": "available",
+            "endpoint": "POST /api/scrape/govplanet",
             "categories": list(GP_CATEGORIES.keys()),
+        },
+        "ebay": {
+            "name": "eBay",
+            "status": "available",
+            "endpoint": "POST /api/scrape/ebay",
+            "mode": "Finding API" if EBAY_APP_ID else "HTML scraping (set EBAY_APP_ID for API mode)",
+            "categories": list(EBAY_CATEGORIES.keys()),
+        },
+        "publicsurplus": {
+            "name": "PublicSurplus",
+            "status": "available",
+            "endpoint": "POST /api/scrape/publicsurplus",
+            "note": "Government/municipal surplus auctions",
+            "categories": list(PS_CATEGORIES.keys()),
         },
         "screenshot_ocr": {
             "name": "Screenshot OCR",
             "status": "available",
+            "endpoint": "POST /api/import/screenshot",
             "supported_formats": ["JPEG", "PNG", "WebP"],
             "vision_model": "GPT-4o (primary) + Tesseract (fallback)",
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# eBay scraper endpoint
+# ---------------------------------------------------------------------------
+
+class EbayScrapeRequest(BaseModel):
+    query: str = ""
+    category: str = "all"
+    listing_type: str = "buy-it-now"
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    max_results: int = 50
+
+
+@app.post("/api/scrape/ebay")
+def scrape_ebay_endpoint(req: EbayScrapeRequest):
+    from scrapers.ebay import scrape_ebay as do_scrape
+
+    result = do_scrape(
+        query=req.query,
+        category=req.category,
+        listing_type=req.listing_type,
+        min_price=req.min_price,
+        max_price=req.max_price,
+        max_results=req.max_results,
+    )
+
+    if result["error"]:
+        return {"success": False, "error": result["error"], "source_url": result["source_url"], "imported": 0, "total_found": 0}
+
+    imported = skipped = 0
+    for listing in result["listings"]:
+        res = process_and_store_listing(listing, "ebay")
+        if res:
+            imported += 1
+        else:
+            skipped += 1
+
+    import_runs_col.insert_one({
+        "source": "ebay", "query": req.query, "category": req.category,
+        "count": imported, "skipped": skipped,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"success": True, "imported": imported, "skipped": skipped,
+            "total_found": result["total_found"], "source_url": result["source_url"]}
+
+
+# ---------------------------------------------------------------------------
+# Craigslist RSS endpoint
+# ---------------------------------------------------------------------------
+
+class CraigslistRssScrapeRequest(BaseModel):
+    city: Optional[str] = None
+    category: str = "all"
+    query: str = ""
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    max_results: int = 120
+
+
+@app.post("/api/scrape/craigslist-rss")
+def scrape_craigslist_rss_endpoint(req: CraigslistRssScrapeRequest):
+    from scrapers.craigslist_rss import scrape_craigslist_rss as do_scrape
+
+    result = do_scrape(
+        city=req.city,
+        category=req.category,
+        query=req.query,
+        min_price=req.min_price,
+        max_price=req.max_price,
+        max_results=req.max_results,
+    )
+
+    if result["error"]:
+        return {"success": False, "error": result["error"], "source_url": result["source_url"], "imported": 0, "total_found": 0}
+
+    imported = skipped = 0
+    for listing in result["listings"]:
+        res = process_and_store_listing(listing, "craigslist_rss")
+        if res:
+            imported += 1
+        else:
+            skipped += 1
+
+    import_runs_col.insert_one({
+        "source": "craigslist_rss", "city": req.city or CRAIGSLIST_LOCATION,
+        "category": req.category, "count": imported, "skipped": skipped,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"success": True, "imported": imported, "skipped": skipped,
+            "total_found": result["total_found"], "source_url": result["source_url"]}
+
+
+# ---------------------------------------------------------------------------
+# PublicSurplus endpoint
+# ---------------------------------------------------------------------------
+
+class PublicSurplusScrapeRequest(BaseModel):
+    query: str = ""
+    category: str = "all"
+    max_price: Optional[float] = None
+    max_results: int = 50
+    state: str = ""
+
+
+@app.post("/api/scrape/publicsurplus")
+def scrape_publicsurplus_endpoint(req: PublicSurplusScrapeRequest):
+    from scrapers.publicsurplus import scrape_publicsurplus as do_scrape
+
+    result = do_scrape(
+        query=req.query,
+        category=req.category,
+        max_price=req.max_price,
+        max_results=req.max_results,
+        state=req.state,
+    )
+
+    if result["error"]:
+        return {"success": False, "error": result["error"], "source_url": result["source_url"], "imported": 0, "total_found": 0}
+
+    imported = skipped = 0
+    for listing in result["listings"]:
+        res = process_and_store_listing(listing, "publicsurplus")
+        if res:
+            imported += 1
+        else:
+            skipped += 1
+
+    import_runs_col.insert_one({
+        "source": "publicsurplus", "query": req.query, "category": req.category,
+        "count": imported, "skipped": skipped,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"success": True, "imported": imported, "skipped": skipped,
+            "total_found": result["total_found"], "source_url": result["source_url"]}
+
+
+# ---------------------------------------------------------------------------
+# Opportunities
+# ---------------------------------------------------------------------------
+
+@app.get("/opportunities")
+def get_opportunities(
+    min_score: float = Query(70, ge=0, le=100),
+    limit: int = Query(50, ge=1, le=200),
+    category: Optional[str] = Query(None),
+):
+    """Return top-scored deals from scored_opportunities, ranked by score desc."""
+    query: dict = {"score": {"$gte": min_score}}
+    if category and category != "all":
+        query["category"] = category
+
+    cursor = scored_opportunities_col.find(query).sort("score", DESCENDING).limit(limit)
+    results = []
+    for doc in cursor:
+        doc.pop("_id", None)
+        results.append(doc)
+
+    _write_scored_json(results)
+
+    return {"opportunities": results, "count": len(results), "min_score": min_score}
+
+
+def _rescore_sync() -> dict:
+    """Rescore all active listings, promote geo fields to top level, upsert opportunities, fire alerts."""
+    cursor = listings_col.find({"is_sold": {"$ne": True}})
+    upserted = alerted = rescored = 0
+    for doc in cursor:
+        listing_id = str(doc["_id"])
+        clean = {k: v for k, v in doc.items() if k != "_id"}
+
+        # Rescore to pick up new geo/practicality fields
+        try:
+            breakdown = score_listing(clean)
+            update_fields = {
+                "score": breakdown["score"],
+                "confidence": breakdown.get("confidence"),
+                "estimated_profit_low": breakdown.get("estimated_profit_low"),
+                "travel_tier": breakdown.get("travel_tier", "unknown"),
+                "distance_miles": breakdown.get("distance_miles"),
+                "effective_profit_after_travel": breakdown.get("effective_profit_after_travel"),
+                "score_breakdown": breakdown,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            listings_col.update_one({"_id": doc["_id"]}, {"$set": update_fields})
+            clean.update(update_fields)
+            rescored += 1
+        except Exception as exc:
+            logger.warning("Rescore failed for %s: %s", listing_id, exc)
+
+        if notifier.is_opportunity(clean):
+            _upsert_opportunity(clean, listing_id)
+            upserted += 1
+            if notifier.maybe_alert(clean, listing_id):
+                alerted += 1
+
+    top = list(
+        scored_opportunities_col.find({"score": {"$gte": 70}})
+        .sort("score", DESCENDING).limit(200)
+    )
+    _write_scored_json([{k: v for k, v in d.items() if k != "_id"} for d in top])
+    return {"rescored": rescored, "upserted": upserted, "alerted": alerted}
+
+
+@app.post("/api/opportunities/rescore")
+def rescore_opportunities():
+    """Scan all listings, upsert opportunities, send Telegram alerts for new high-score items."""
+    return _rescore_sync()
+
+
+@app.post("/api/opportunities/alert-test")
+def alert_test():
+    """Simulate one Telegram alert using the current top-scoring listing."""
+    doc = scored_opportunities_col.find_one(sort=[("score", DESCENDING)])
+    if not doc:
+        doc = listings_col.find_one(sort=[("score", DESCENDING)])
+    if not doc:
+        return {"sent": False, "reason": "No listings found"}
+
+    doc.pop("_id", None)
+    sent = notifier.send_test_alert(doc)
+    return {
+        "sent": sent,
+        "listing": doc.get("title"),
+        "score": doc.get("score"),
+        "reason": "OK" if sent else "Telegram not configured — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID",
+    }
+
+
+def _get_field(doc: dict, field: str, default=None):
+    """Read a field from top level or score_breakdown fallback."""
+    v = doc.get(field)
+    if v is None:
+        v = (doc.get("score_breakdown") or {}).get(field, default)
+    return v if v is not None else default
+
+
+def _serialize_opportunity(doc: dict) -> dict:
+    """Serialize a listing doc for opportunity endpoints."""
+    doc = dict(doc)
+    doc["id"] = str(doc.pop("_id", ""))
+    return {
+        "id": doc.get("id"),
+        "source": doc.get("source"),
+        "title": doc.get("title"),
+        "price": doc.get("price"),
+        "score": doc.get("score"),
+        "confidence": _get_field(doc, "confidence"),
+        "estimated_profit_low": _get_field(doc, "estimated_profit_low"),
+        "effective_profit_after_travel": _get_field(doc, "effective_profit_after_travel"),
+        "distance_miles": _get_field(doc, "distance_miles"),
+        "travel_tier": _get_field(doc, "travel_tier", "unknown"),
+        "listing_url": doc.get("listing_url", ""),
+        "category": doc.get("category"),
+        "location": doc.get("location"),
+        "alert_reason": notifier.alert_reason(doc),
+    }
+
+
+@app.get("/opportunities/local-best")
+def get_local_best():
+    """Top local/stretch opportunities sorted by score — the flip-ready shortlist."""
+    results = []
+    cursor = listings_col.find({"is_sold": {"$ne": True}}).sort("score", DESCENDING).limit(500)
+    for doc in cursor:
+        tier = _get_field(doc, "travel_tier", "unknown")
+        profit_low = _get_field(doc, "estimated_profit_low") or 0
+        qualifies = (
+            tier in ("local", "unknown")
+            or (tier == "stretch" and profit_low >= 500)
+        )
+        if qualifies:
+            results.append(_serialize_opportunity(doc))
+        if len(results) >= 20:
+            break
+    return {"opportunities": results, "count": len(results)}
+
+
+@app.get("/opportunities/high-value")
+def get_high_value():
+    """Top listings by estimated profit where score >= 85 and confidence >= 0.7."""
+    candidates = []
+    cursor = listings_col.find({"is_sold": {"$ne": True}}).sort("score", DESCENDING).limit(500)
+    for doc in cursor:
+        score = doc.get("score") or 0
+        confidence = _get_field(doc, "confidence") or 0
+        if score >= 85 and confidence >= 0.7:
+            candidates.append(_serialize_opportunity(doc))
+    candidates.sort(key=lambda x: x.get("estimated_profit_low") or 0, reverse=True)
+    return {"opportunities": candidates[:20], "count": min(len(candidates), 20)}
 
 
 # ---------------------------------------------------------------------------
@@ -757,10 +1126,219 @@ def seed_data():
     return {"message": f"Seeded {count} listings", "count": count}
 
 
-# Auto-seed on startup
+# ---------------------------------------------------------------------------
+# Scheduler helpers
+# ---------------------------------------------------------------------------
+
+def _log_scrape_run(source: str, total_found: int, imported: int, error: Optional[str] = None) -> None:
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "total_found": total_found,
+        "imported": imported,
+        "error": error,
+    }
+    try:
+        SCRAPE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log: list = []
+        if SCRAPE_LOG_PATH.exists():
+            log = json.loads(SCRAPE_LOG_PATH.read_text())
+        log.append(entry)
+        SCRAPE_LOG_PATH.write_text(json.dumps(log[-500:], indent=2))
+    except Exception as exc:
+        logger.warning("Could not write scrape_log.json: %s", exc)
+
+
+def _process_batch(listings: list, source: str) -> tuple:
+    imported = skipped = 0
+    for listing in listings:
+        if process_and_store_listing(listing, source):
+            imported += 1
+        else:
+            skipped += 1
+    return imported, skipped
+
+
+def _get_recent_log(n: int = 10) -> list:
+    if not SCRAPE_LOG_PATH.exists():
+        return []
+    try:
+        return json.loads(SCRAPE_LOG_PATH.read_text())[-n:]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Scheduled async run functions
+# ---------------------------------------------------------------------------
+
+async def _run_craigslist_sched() -> int:
+    from scrapers.craigslist import scrape_craigslist as do_scrape
+    result = await asyncio.to_thread(do_scrape, city=CRAIGSLIST_LOCATION, category="all", max_results=80)
+    total = result.get("total_found", 0)
+    imported, _ = await asyncio.to_thread(_process_batch, result.get("listings", []), "craigslist")
+    _log_scrape_run("craigslist", total, imported, result.get("error"))
+    if imported:
+        import_runs_col.insert_one({
+            "source": "craigslist", "city": CRAIGSLIST_LOCATION,
+            "count": imported, "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    return imported
+
+
+async def _run_govplanet_sched() -> int:
+    from scrapers.govplanet import scrape_govplanet as do_scrape
+    result = await asyncio.to_thread(do_scrape, category="all", max_results=50)
+    total = result.get("total_found", 0)
+    imported, _ = await asyncio.to_thread(_process_batch, result.get("listings", []), "govplanet")
+    _log_scrape_run("govplanet", total, imported, result.get("error"))
+    if imported:
+        import_runs_col.insert_one({
+            "source": "govplanet", "count": imported,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    return imported
+
+
+async def _run_publicsurplus_sched() -> int:
+    from scrapers.publicsurplus import scrape_publicsurplus as do_scrape
+    imported = 0
+    for cat in ("vehicles", "heavy-equipment", "tools"):
+        result = await asyncio.to_thread(do_scrape, category=cat, max_results=30)
+        batch, _ = await asyncio.to_thread(_process_batch, result.get("listings", []), "publicsurplus")
+        imported += batch
+        _log_scrape_run(f"publicsurplus/{cat}", result.get("total_found", 0), batch, result.get("error"))
+    if imported:
+        import_runs_col.insert_one({
+            "source": "publicsurplus", "count": imported,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    return imported
+
+
+async def _run_facebook_sched() -> int:
+    if not FB_COOKIES_PATH.exists():
+        logger.info("FB scheduler: cookies not at %s — skipping", FB_COOKIES_PATH)
+        SCHEDULER_STATUS["facebook"]["last_error"] = "no_cookies"
+        _log_scrape_run("facebook", 0, 0, "no_cookies")
+        return 0
+    try:
+        cookie_data = json.loads(FB_COOKIES_PATH.read_text())
+        if not cookie_data:
+            raise ValueError("empty list")
+    except Exception as exc:
+        SCHEDULER_STATUS["facebook"]["last_error"] = f"invalid_cookies: {exc}"
+        _log_scrape_run("facebook", 0, 0, f"invalid_cookies: {exc}")
+        return 0
+    try:
+        from modules.marketplace_scraper.scraper import PlaywrightScraper
+        async with PlaywrightScraper(cookies_path=str(FB_COOKIES_PATH), headless=True) as scraper:
+            raw = await scraper.search_multiple(
+                queries=["electronics", "furniture", "tools", "motorcycles"],
+                location="", max_pages=2,
+            )
+        imported, _ = await asyncio.to_thread(_process_batch, raw, "facebook")
+        _log_scrape_run("facebook", len(raw), imported)
+        return imported
+    except Exception as exc:
+        logger.error("FB scheduler: scrape failed: %s", exc)
+        SCHEDULER_STATUS["facebook"]["last_error"] = str(exc)
+        _log_scrape_run("facebook", 0, 0, str(exc))
+        return 0
+
+
+async def _run_ebay_sched() -> int:
+    from scrapers.ebay import scrape_ebay as do_scrape
+    imported = 0
+    for cat in ("motorcycles", "heavy-equipment", "tools"):
+        try:
+            result = await asyncio.to_thread(
+                do_scrape, category=cat, listing_type="buy-it-now", max_results=30
+            )
+            batch, _ = await asyncio.to_thread(_process_batch, result.get("listings", []), "ebay")
+            imported += batch
+            _log_scrape_run(f"ebay/{cat}", result.get("total_found", 0), batch, result.get("error"))
+        except Exception as exc:
+            logger.warning("eBay scheduler (%s): %s", cat, exc)
+            _log_scrape_run(f"ebay/{cat}", 0, 0, str(exc))
+    return imported
+
+
+async def _schedule_loop(source: str, fn, interval_minutes: int, initial_delay_secs: int = 0) -> None:
+    if initial_delay_secs:
+        await asyncio.sleep(initial_delay_secs)
+    while True:
+        now = datetime.now(timezone.utc)
+        SCHEDULER_STATUS[source]["running"] = True
+        SCHEDULER_STATUS[source]["last_run"] = now.isoformat()
+        next_ts = now.timestamp() + interval_minutes * 60
+        SCHEDULER_STATUS[source]["next_run"] = datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat()
+        try:
+            count = await fn()
+            SCHEDULER_STATUS[source]["last_imported"] = count
+            SCHEDULER_STATUS[source]["last_error"] = None
+            logger.info("Scheduler [%s]: %d new imports", source, count)
+            if count > 0:
+                await asyncio.to_thread(_rescore_sync)
+        except Exception as exc:
+            logger.error("Scheduler [%s] failed: %s", source, exc)
+            SCHEDULER_STATUS[source]["last_error"] = str(exc)
+        finally:
+            SCHEDULER_STATUS[source]["running"] = False
+        elapsed = datetime.now(timezone.utc).timestamp() - now.timestamp()
+        await asyncio.sleep(max(10, interval_minutes * 60 - elapsed))
+
+
+# ---------------------------------------------------------------------------
+# Scraper status endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/scraper/status")
+def get_scraper_status():
+    """Return scheduler state per source plus last 10 log entries."""
+    return {
+        "sources": SCHEDULER_STATUS,
+        "log_path": str(SCRAPE_LOG_PATH),
+        "recent_log": _get_recent_log(10),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Auto-seed and populate scored_opportunities on startup
+# ---------------------------------------------------------------------------
+
 @app.on_event("startup")
 async def startup_event():
     if listings_col.count_documents({}) == 0:
         logger.info("No listings found, seeding sample data...")
         seed_data()
         logger.info("Seed complete")
+
+    if scored_opportunities_col.count_documents({}) == 0:
+        logger.info("Populating scored_opportunities from existing listings...")
+        count = 0
+        for doc in listings_col.find({"is_sold": {"$ne": True}}):
+            listing_id = str(doc["_id"])
+            clean = {k: v for k, v in doc.items() if k != "_id"}
+            if notifier.is_opportunity(clean):
+                _upsert_opportunity(clean, listing_id)
+                count += 1
+        logger.info("scored_opportunities populated with %d items", count)
+        top = list(
+            scored_opportunities_col.find({"score": {"$gte": 70}})
+            .sort("score", DESCENDING)
+            .limit(200)
+        )
+        _write_scored_json([{k: v for k, v in d.items() if k != "_id"} for d in top])
+
+    # Launch background scrape scheduler
+    # Staggered initial delays prevent all sources hammering at once on startup
+    logger.info("Launching background scrape scheduler...")
+    asyncio.create_task(_schedule_loop("craigslist",    _run_craigslist_sched,    interval_minutes=30, initial_delay_secs=15))
+    asyncio.create_task(_schedule_loop("govplanet",     _run_govplanet_sched,     interval_minutes=60, initial_delay_secs=45))
+    asyncio.create_task(_schedule_loop("publicsurplus", _run_publicsurplus_sched, interval_minutes=60, initial_delay_secs=75))
+    asyncio.create_task(_schedule_loop("facebook",      _run_facebook_sched,      interval_minutes=45, initial_delay_secs=105))
+    asyncio.create_task(_schedule_loop("ebay",          _run_ebay_sched,          interval_minutes=60, initial_delay_secs=135))
+    logger.info(
+        "Scheduler running: craigslist=30m, govplanet=60m, publicsurplus=60m, facebook=45m, ebay=60m"
+    )
