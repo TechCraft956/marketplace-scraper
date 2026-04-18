@@ -113,6 +113,83 @@ CATEGORY_PRICE_REFERENCE: dict[str, tuple[float, float, float]] = {
     "jordan": (100, 250, 600),
     "vintage": (50, 200, 800),
     "antique": (50, 250, 1000),
+    # --- High-ticket: vehicles ---
+    "car": (2000, 8000, 25000),
+    "truck": (3000, 12000, 35000),
+    "pickup truck": (4000, 15000, 38000),
+    "semi truck": (15000, 45000, 120000),
+    "semi": (15000, 45000, 120000),
+    "motorcycle": (1500, 5000, 15000),
+    "harley": (3000, 8000, 25000),
+    "harley davidson": (3000, 8000, 25000),
+    "kawasaki": (1500, 4500, 12000),
+    "yamaha": (1500, 4500, 12000),
+    "honda motorcycle": (1500, 4000, 10000),
+    "dirt bike": (1000, 3000, 8000),
+    "atv": (1000, 4000, 12000),
+    "side by side": (3000, 8000, 20000),
+    "rzr": (5000, 12000, 25000),
+    "trailer": (1000, 4000, 15000),
+    "utility trailer": (500, 2500, 8000),
+    "enclosed trailer": (1500, 5000, 15000),
+    "dump trailer": (2000, 6000, 20000),
+    "flatbed trailer": (1000, 3500, 12000),
+    "cargo trailer": (1000, 4000, 12000),
+    "boat": (2000, 8000, 30000),
+    "pontoon": (5000, 18000, 50000),
+    "rv": (10000, 35000, 100000),
+    "motorhome": (15000, 45000, 120000),
+    # --- High-ticket: heavy equipment (GovPlanet/PublicSurplus focus) ---
+    "excavator": (10000, 35000, 120000),
+    "mini excavator": (5000, 18000, 50000),
+    "backhoe": (8000, 25000, 80000),
+    "skid steer": (6000, 20000, 60000),
+    "bobcat": (6000, 20000, 60000),
+    "bulldozer": (15000, 50000, 150000),
+    "wheel loader": (15000, 50000, 150000),
+    "front loader": (8000, 30000, 90000),
+    "forklift": (4000, 12000, 40000),
+    "telehandler": (15000, 45000, 120000),
+    "boom lift": (10000, 30000, 90000),
+    "scissor lift": (5000, 18000, 50000),
+    "tractor": (5000, 20000, 80000),
+    "john deere": (5000, 20000, 80000),
+    "kubota": (4000, 15000, 60000),
+    "caterpillar": (15000, 60000, 200000),
+    "cat": (15000, 60000, 200000),
+    "komatsu": (12000, 45000, 150000),
+    "crane": (20000, 80000, 250000),
+    "aerial lift": (8000, 25000, 80000),
+    "compactor": (5000, 20000, 60000),
+    "road roller": (8000, 25000, 80000),
+    "paver": (15000, 50000, 150000),
+    "generator": (500, 2500, 15000),
+    "industrial generator": (3000, 15000, 60000),
+    "welder": (300, 1200, 5000),
+    "air compressor": (100, 600, 3000),
+    "industrial compressor": (1000, 5000, 20000),
+    "pressure washer": (100, 400, 2000),
+    "industrial pressure washer": (500, 2500, 10000),
+    "wood chipper": (2000, 8000, 25000),
+    "stump grinder": (2000, 8000, 25000),
+    "trencher": (3000, 12000, 40000),
+    # --- Tools (eBay/GovPlanet) ---
+    "snap on": (200, 1000, 8000),
+    "snap-on": (200, 1000, 8000),
+    "tool box": (100, 500, 3000),
+    "tool chest": (100, 500, 3000),
+    "table saw": (200, 600, 2500),
+    "band saw": (100, 400, 1500),
+    "miter saw": (100, 350, 1200),
+    "lathe": (500, 2500, 10000),
+    "metal lathe": (800, 4000, 15000),
+    "mill": (1000, 5000, 20000),
+    "milling machine": (1000, 5000, 20000),
+    "drill press": (100, 400, 1500),
+    "plasma cutter": (300, 1200, 5000),
+    "tig welder": (400, 1800, 8000),
+    "mig welder": (200, 800, 3000),
+    "stick welder": (100, 400, 1500),
     # Generic fallback
     "__default__": (10, 100, 500),
 }
@@ -158,6 +235,9 @@ URGENCY_KEYWORDS: dict[str, int] = {
     "divorce": 9,
     "estate sale": 7,
     # Medium urgency (5-7 pts)
+    "today only": 8,
+    "liquidating": 8,
+    "urgent": 7,
     "obo": 6,
     "or best offer": 6,
     "best offer": 5,
@@ -181,12 +261,120 @@ URGENCY_KEYWORDS: dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
+# Category weights
+# ---------------------------------------------------------------------------
+
+CATEGORY_WEIGHTS: dict[str, int] = {
+    "vehicles": 20,
+    "motorcycles": 20,
+    "cars+trucks": 20,
+    "equipment": 25,
+    "heavy_equipment": 25,
+    "tools": 10,
+    "electronics": 10,
+    "bulk": -15,
+    "general": -5,
+    "unknown": -20,
+}
+
+
+def _get_category_weight(category: str, title: str) -> int:
+    if category:
+        key = category.lower().strip()
+        if key in CATEGORY_WEIGHTS:
+            return CATEGORY_WEIGHTS[key]
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Confidence score
+# ---------------------------------------------------------------------------
+
+def confidence_score(listing: dict) -> float:
+    score = 0.5
+    title = (listing.get("title") or "").lower().strip()
+    category = (listing.get("category") or "").lower().strip()
+    price = listing.get("price")
+    posted_at_raw = listing.get("posted_at")
+
+    # Title clarity
+    words = [w for w in title.split() if len(w) > 1]
+    if len(words) < 3 or any(t in title for t in ("misc", "stuff", "lot", "junk")):
+        score -= 0.2
+    elif len(words) >= 4:
+        score += 0.2
+
+    # Category match
+    high_conf_cats = {"vehicles", "motorcycles", "cars+trucks", "equipment", "heavy_equipment", "tools", "electronics"}
+    low_conf_cats = {"bulk", "unknown", "general"}
+    if category in high_conf_cats:
+        score += 0.3
+    elif category in low_conf_cats:
+        score -= 0.2
+
+    # Price anomaly vs median
+    if price is not None and price > 0:
+        median = get_category_median(title, category)
+        if median > 0:
+            if price < median * 0.5:
+                score += 0.3
+            elif price > median:
+                score -= 0.2
+
+    # Recency
+    posted_at: Optional[datetime] = None
+    if isinstance(posted_at_raw, str):
+        try:
+            posted_at = datetime.fromisoformat(posted_at_raw)
+        except Exception:
+            pass
+    elif isinstance(posted_at_raw, datetime):
+        posted_at = posted_at_raw
+
+    if posted_at is not None:
+        age_hours = (datetime.utcnow() - posted_at).total_seconds() / 3600
+        if age_hours < 6:
+            score += 0.2
+        elif age_hours > 168:  # 7 days
+            score -= 0.1
+
+    return max(0.0, min(1.0, score))
+
+
+# ---------------------------------------------------------------------------
+# Profit estimation
+# ---------------------------------------------------------------------------
+
+def estimate_profit(price: float, category: str, title: str) -> dict:
+    median = get_category_median(title, category)
+    estimated_resale_low = median * 0.7
+    estimated_resale_high = median * 1.1
+    estimated_profit_low = estimated_resale_low - price
+    estimated_profit_high = estimated_resale_high - price
+
+    profit_boost = 0
+    if estimated_profit_low >= 500:
+        profit_boost = 15
+    elif estimated_resale_low > 0 and (estimated_resale_low - price) / estimated_resale_low >= 0.30:
+        profit_boost = 10
+
+    return {
+        "median": median,
+        "estimated_resale_low": estimated_resale_low,
+        "estimated_resale_high": estimated_resale_high,
+        "estimated_profit_low": estimated_profit_low,
+        "estimated_profit_high": estimated_profit_high,
+        "profit_boost": profit_boost,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Score result dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ScoreBreakdown:
-    score: float                      # 0-100 total
+    score: float                      # 0-150 total
     price_score: float                # 0-40
     urgency_score: float              # 0-20
     recency_score: float              # 0-15
@@ -197,6 +385,14 @@ class ScoreBreakdown:
     matched_keywords: list[str]
     days_listed: Optional[float]
     explanation: str
+    confidence: float = 0.5
+    estimated_resale_low: Optional[float] = None
+    estimated_resale_high: Optional[float] = None
+    estimated_profit_low: Optional[float] = None
+    estimated_profit_high: Optional[float] = None
+    category_weight: int = 0
+    urgency_matched: list = field(default_factory=list)
+    profit_boost: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +411,14 @@ class ScoreBreakdown:
             "matched_keywords": self.matched_keywords,
             "days_listed": self.days_listed,
             "explanation": self.explanation,
+            "confidence": round(self.confidence, 3),
+            "estimated_resale_low": round(self.estimated_resale_low, 2) if self.estimated_resale_low is not None else None,
+            "estimated_resale_high": round(self.estimated_resale_high, 2) if self.estimated_resale_high is not None else None,
+            "estimated_profit_low": round(self.estimated_profit_low, 2) if self.estimated_profit_low is not None else None,
+            "estimated_profit_high": round(self.estimated_profit_high, 2) if self.estimated_profit_high is not None else None,
+            "category_weight": self.category_weight,
+            "urgency_matched": self.urgency_matched,
+            "profit_boost": self.profit_boost,
         }
 
 
@@ -288,15 +492,21 @@ class ResaleScorer:
         # ---- 5. Distance score (0-15) ----
         distance_score = self._score_distance(distance)
 
+        # ---- Extended layers ----
+        cat_weight = _get_category_weight(category or "", title)
+        profit_data = estimate_profit(price or 0.0, category or "", title)
+        conf = confidence_score(listing)
+
         # ---- Total ----
-        total = (
+        base_score = (
             price_score
             + urgency_score
             + recency_score
             + image_score
             + distance_score
         )
-        total = max(0.0, min(100.0, total))
+        total = base_score + cat_weight + profit_data["profit_boost"]
+        total = max(0.0, min(150.0, total))
 
         explanation = self._build_explanation(
             price_score=price_score,
@@ -323,6 +533,14 @@ class ResaleScorer:
             matched_keywords=matched_keywords,
             days_listed=days_listed,
             explanation=explanation,
+            confidence=conf,
+            estimated_resale_low=profit_data["estimated_resale_low"],
+            estimated_resale_high=profit_data["estimated_resale_high"],
+            estimated_profit_low=profit_data["estimated_profit_low"],
+            estimated_profit_high=profit_data["estimated_profit_high"],
+            category_weight=cat_weight,
+            urgency_matched=matched_keywords,
+            profit_boost=profit_data["profit_boost"],
         )
 
     # ------------------------------------------------------------------
@@ -545,6 +763,7 @@ def score_listings(
         try:
             result = scorer.score(listing)
             listing["score"] = result.score
+            listing["confidence"] = result.confidence
             listing["score_breakdown"] = result.to_dict()
         except Exception as exc:
             logger.warning(
