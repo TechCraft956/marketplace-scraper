@@ -27,6 +27,7 @@ from bson import ObjectId
 
 # Import scoring engine directly (avoid triggering full module init)
 from modules.marketplace_scraper.scorer import ResaleScorer, CATEGORY_PRICE_REFERENCE, URGENCY_KEYWORDS
+from vehicle_deals import VehicleDealEvaluationRequest, evaluate_vehicle_deals
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -232,6 +233,11 @@ def _write_scored_json(results: list) -> None:
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "dealscope", "version": "1.0.0"}
+
+
+@app.post("/api/vehicle-deals/evaluate")
+def evaluate_vehicle_deals_endpoint(payload: VehicleDealEvaluationRequest):
+    return evaluate_vehicle_deals(payload)
 
 
 @app.get("/api/listings")

@@ -48,11 +48,65 @@ asyncio.run(main())
 
 ✓ **Playwright-based scraping** — Browser automation with stealth config, human-like delays, retry logic
 ✓ **Deal scoring** — 0-100 point system across 5 factors (price vs median, urgency keywords, recency, images, distance)
+✓ **Vehicle financing deal evaluation** — Manual 1..10 deal comparison with payment math, total cost, rank, and pursue / negotiate / pass guidance
 ✓ **Smart filtering** — Chainable pipeline: price range, keywords, distance, category, score threshold
 ✓ **Persistent storage** — SQLite database with dedup, scoring breakdown, run history
 ✓ **Dashboard integration** — FastAPI module with SSE streaming, React panel with live updates
 ✓ **Dark UI** — Operator aesthetic: score glow badges, urgency chips, expandable details
 ✓ **Type-safe** — Full type hints, Pydantic config validation, async/await throughout
+
+## Vehicle Financing Deal Optimizer MVP
+
+A minimal evaluator API is available for manually comparing up to 10 vehicle purchase scenarios without changing the scraping or ingestion flows.
+
+### Endpoint
+
+`POST /api/vehicle-deals/evaluate`
+
+### Request body
+
+```json
+{
+  "deals": [
+    {
+      "listing_title": "2020 Honda Civic EX",
+      "asking_price": 18900,
+      "year": 2020,
+      "make": "Honda",
+      "model": "Civic",
+      "mileage": 48000,
+      "apr": 8.9,
+      "loan_term_months": 72,
+      "down_payment": 2000,
+      "estimated_taxes_and_fees": 1500,
+      "distance_miles": 22,
+      "estimated_fair_market_value": 21500,
+      "trim": "EX",
+      "condition_score": 8,
+      "seller_type": "dealer",
+      "inventory_age_days": 37,
+      "title_status": "clean"
+    }
+  ]
+}
+```
+
+### Response shape
+
+Each evaluated deal returns:
+- `rank`
+- `financed_amount`
+- `estimated_monthly_payment`
+- `total_interest_paid`
+- `total_acquisition_cost`
+- `market_spread`
+- `distance_penalty`
+- `deal_score`
+- `recommendation`
+- `reason_to_act`
+- `top_risks`
+
+The response also includes `best_deal` for the top-ranked option.
 
 ---
 
