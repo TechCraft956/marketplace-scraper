@@ -24,11 +24,14 @@ services:
       - FAR_OVERRIDE_PROFIT=2500
       - FAR_OVERRIDE_CATEGORIES=heavy_equipment,equipment,vehicles,motorcycles,cars+trucks
       - LOCAL_FLIPS_MODE=true
+      - CRAIGSLIST_LOCATION=sfbay,mcallen,laredo,corpuschristi,harlingen
     volumes:
       # Cookies for Playwright auth — place fb_cookies.json here before scraping
       - ./data/cookies:/app/cookies
       # SQLite fallback storage and any module output
       - ./data/storage:/app/storage
+      # Host-bound operator runtime outputs
+      - /Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime:/Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime
     depends_on:
       mongo:
         condition: service_healthy

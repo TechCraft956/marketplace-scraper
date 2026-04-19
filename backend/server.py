@@ -333,8 +333,9 @@ DEPRIORITIZED_SOURCES = {"publicsurplus", "govplanet"}
 TOP_TIER_LOCAL_DISTANCE = 50.0
 STRETCH_LOCAL_DISTANCE = 100.0
 VERY_HIGH_SCORE_THRESHOLD = 110.0
-HIGH_DEPRIORITIZED_SCORE = 120.0
+HIGH_DEPRITIZED_SCORE = 120.0
 TOP_DEALS_LIMIT = 3
+CRAIGSLIST_RUNTIME_CITY = os.environ.get("CRAIGSLIST_LOCATION", "sfbay")
 
 
 def _normalize_source(value: Optional[str]) -> str:
@@ -360,12 +361,64 @@ def _source_allowed(listing: dict) -> bool:
     score = float(listing.get("score") or 0)
     distance = _normalized_distance(listing)
     if source == "publicsurplus":
-        return score >= HIGH_DEPRIORITIZED_SCORE and distance is not None and distance <= STRETCH_LOCAL_DISTANCE
+        return score >= HIGH_DEPRITIZED_SCORE and distance is not None and distance <= STRETCH_LOCAL_DISTANCE
     if source == "govplanet":
         return distance is not None and distance <= STRETCH_LOCAL_DISTANCE and score >= VERY_HIGH_SCORE_THRESHOLD
     return False
 
 
+
+
+def _normalize_marketplace_location(listing: dict) -> None:
+    location = (listing.get("location") or "").strip()
+    title = (listing.get("title") or "").strip()
+    if not location and title:
+        tail = re.sub(r".*\$(?:\d[\d,]*(?:\.\d+)?)", "", title).strip(" -,")
+        if tail and len(tail) > 1:
+            location = tail
+    if location:
+        location = re.sub(r"\s+", " ", location).strip()
+        listing["location"] = location
+
+
+def _apply_craigslist_locality(listing: dict) -> None:
+    if (listing.get("source") or "").lower() != "craigslist":
+        return
+    _normalize_marketplace_location(listing)
+    if listing.get("distance_miles") is not None:
+        return
+    location = (listing.get("location") or "").lower()
+    if not location:
+        listing["travel_tier"] = listing.get("travel_tier") or "unknown"
+        return
+    local_markers = ["san francisco", "oakland", "berkeley", "daly city", "south san francisco", "burlingame", "san mateo", "redwood city", "palo alto", "mountain view", "san jose", "fremont", "hayward", "santa clara", "sunnyvale"]
+    stretch_markers = ["santa rosa", "napa", "sonoma", "sacramento", "stockton", "modesto", "monterey", "salinas", "santa cruz"]
+    if any(marker in location for marker in local_markers):
+        listing["distance_miles"] = 25.0
+        listing["travel_tier"] = "local"
+    elif any(marker in location for marker in stretch_markers):
+        listing["distance_miles"] = 85.0
+        listing["travel_tier"] = "stretch"
+    elif listing.get("travel_tier") in (None, "unknown"):
+        listing["travel_tier"] = "unknown"
+
+
+def _finalize_candidate(listing: dict) -> dict:
+    item = dict(listing)
+    _normalize_marketplace_location(item)
+    _apply_craigslist_locality(item)
+    if item.get("estimated_value") is None:
+        item["estimated_value"] = _estimated_value(item)
+    if not item.get("reason_to_act"):
+        label = item.get("signal_label") or _signal_label(item)
+        reasons = {
+            "local_actionable": "local price/value mismatch worth acting on now",
+            "local_watch": "local candidate worth watching",
+            "stretch_candidate": "stretch-distance candidate with some resale upside",
+            "weak_signal": "best available candidate in a weak run",
+        }
+        item["reason_to_act"] = reasons.get(label, "best available candidate")
+    return item
 def _quality_allowed(listing: dict) -> bool:
     title = (listing.get("title") or "").strip()
     if not title:
@@ -466,7 +519,11 @@ def _candidate_rank_tuple(listing: dict):
 
 
 def _select_marketplace_candidates(top_actions: list[dict], fallback_docs: list[dict]) -> tuple[list[dict], bool]:
-    actionable = [item for item in top_actions if _local_opportunity_allowed(item)]
+    actionable = []
+    for item in top_actions:
+        enriched = _finalize_candidate(item)
+        if _local_opportunity_allowed(enriched):
+            actionable.append(enriched)
     if actionable:
         selected = actionable[:TOP_DEALS_LIMIT]
         for item in selected:
@@ -475,11 +532,11 @@ def _select_marketplace_candidates(top_actions: list[dict], fallback_docs: list[
 
     fallback = []
     for item in top_actions + fallback_docs:
-        if not _source_allowed(item):
+        enriched = _finalize_candidate(item)
+        if not _source_allowed(enriched):
             continue
-        if not _quality_allowed(item):
+        if not _quality_allowed(enriched):
             continue
-        enriched = dict(item)
         enriched["signal_label"] = _signal_label(enriched)
         fallback.append(enriched)
 
