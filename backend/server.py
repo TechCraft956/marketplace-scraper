@@ -16,12 +16,16 @@ from typing import Optional
 
 import notifier
 import action_engine
+from task_audit import append_task_record, append_task_state_change, append_audit_event
+from events import emit, get_recent, register_sse_queue, unregister_sse_queue
+from operator_console import build_console_data
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException
+from fastapi import FastAPI, UploadFile, File, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pymongo import MongoClient, DESCENDING
 from bson import ObjectId
 
@@ -324,8 +328,106 @@ def generate_hash(title: str, price, source: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+LOCAL_ONLY_SOURCES = {"craigslist", "craigslist_rss", "ebay"}
+DEPRIORITIZED_SOURCES = {"publicsurplus", "govplanet"}
+TOP_TIER_LOCAL_DISTANCE = 50.0
+STRETCH_LOCAL_DISTANCE = 100.0
+VERY_HIGH_SCORE_THRESHOLD = 110.0
+HIGH_DEPRIORITIZED_SCORE = 120.0
+TOP_DEALS_LIMIT = 5
+
+
+def _normalize_source(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
+
+
+def _normalized_distance(listing: dict) -> Optional[float]:
+    raw = listing.get("distance_miles")
+    if raw is None:
+        raw = listing.get("distance")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_allowed(listing: dict) -> bool:
+    source = _normalize_source(listing.get("source"))
+    if source == "facebook":
+        return False
+    if source in LOCAL_ONLY_SOURCES:
+        return True
+    score = float(listing.get("score") or 0)
+    distance = _normalized_distance(listing)
+    if source == "publicsurplus":
+        return score >= HIGH_DEPRIORITIZED_SCORE and distance is not None and distance <= STRETCH_LOCAL_DISTANCE
+    if source == "govplanet":
+        return distance is not None and distance <= STRETCH_LOCAL_DISTANCE and score >= VERY_HIGH_SCORE_THRESHOLD
+    return False
+
+
+def _quality_allowed(listing: dict) -> bool:
+    title = (listing.get("title") or "").strip()
+    if not title:
+        return False
+    if len(title.split()) < 3:
+        return False
+    lowered = title.lower()
+    if lowered in {"n/a", "unknown", "misc", "stuff", "item"}:
+        return False
+
+    price = listing.get("price")
+    if price is None:
+        return False
+    try:
+        if float(price) <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    combined = f"{title} {(listing.get('description') or '')}".lower()
+    spam_markers = (
+        "call for price", "contact for price", "see description",
+        "financing available", "weekly payment", "stock photo",
+    )
+    if any(marker in combined for marker in spam_markers):
+        return False
+
+    return True
+
+
+def _local_opportunity_allowed(listing: dict) -> bool:
+    if not _source_allowed(listing):
+        return False
+    if not _quality_allowed(listing):
+        return False
+
+    score = float(listing.get("score") or 0)
+    distance = _normalized_distance(listing)
+    if distance is None:
+        return False
+    if distance <= TOP_TIER_LOCAL_DISTANCE:
+        return True
+    if distance <= STRETCH_LOCAL_DISTANCE and score >= VERY_HIGH_SCORE_THRESHOLD:
+        return True
+    return False
+
+
+def _estimated_value(listing: dict) -> Optional[float]:
+    for key in ("estimated_resale_high", "estimated_resale_low", "category_median"):
+        value = listing.get(key)
+        if value is None:
+            value = (listing.get("score_breakdown") or {}).get(key)
+        if value is not None:
+            try:
+                return round(float(value), 2)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 def score_listing(listing: dict) -> dict:
-    scorer = ResaleScorer(max_acceptable_distance=100.0)
+    scorer = ResaleScorer(max_acceptable_distance=STRETCH_LOCAL_DISTANCE)
     result = scorer.score(listing)
     return result.to_dict()
 
@@ -350,6 +452,180 @@ def _write_scored_json(results: list) -> None:
         logger.warning("Could not write scored.json: %s", e)
 
 
+
+
+def _agency_output_path() -> Path:
+    return Path(os.environ.get("PINEAPPLE_CONTROL_PLANE_DIR", "/Users/DdyFngr/.openclaw/workspace/control-plane")) / "agencies" / "marketplace-opportunity" / "latest-output.json"
+
+
+def _write_marketplace_agency_output(top_actions: list[dict], run_summary: dict) -> None:
+    output = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "agency": "marketplace-opportunity",
+        "policy": {
+            "sources": sorted(list(LOCAL_ONLY_SOURCES)),
+            "top_tier_distance_miles": TOP_TIER_LOCAL_DISTANCE,
+            "stretch_distance_miles": STRETCH_LOCAL_DISTANCE,
+            "stretch_requires_score_gte": VERY_HIGH_SCORE_THRESHOLD,
+            "top_n": TOP_DEALS_LIMIT,
+        },
+        "run_summary": run_summary,
+        "top_deals": [
+            {
+                "title": item.get("title"),
+                "price": item.get("price"),
+                "estimated_value": item.get("estimated_value"),
+                "distance": item.get("distance_miles"),
+                "reason_to_act": item.get("reason_to_act"),
+                "source": item.get("source"),
+                "listing_url": item.get("listing_url"),
+            }
+            for item in top_actions[:TOP_DEALS_LIMIT]
+        ],
+        "source_breakdown": run_summary.get("source_breakdown", []),
+    }
+    path = _agency_output_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(output, indent=2, default=str))
+
+
+def _refresh_executive_outputs() -> dict:
+    base = Path(os.environ.get("PINEAPPLE_CONTROL_PLANE_DIR", "/Users/DdyFngr/.openclaw/workspace/control-plane"))
+    tasks_path = base / "state" / "tasks.jsonl"
+    audit_path = base / "logs" / "audit.jsonl"
+    decision_path = base / "state" / "decision-inbox.json"
+    brief_path = base / "state" / "daily-brief.md"
+    exception_path = base / "state" / "exception-stream.jsonl"
+
+    task_rows = []
+    if tasks_path.exists():
+        for line in tasks_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line == '[]':
+                continue
+            try:
+                task_rows.append(json.loads(line))
+            except Exception:
+                continue
+
+    latest_by_task = {}
+    for row in task_rows:
+        task_id = row.get("task_id")
+        if not task_id:
+            continue
+        latest_by_task[task_id] = {**latest_by_task.get(task_id, {}), **row}
+
+    active = [t for t in latest_by_task.values() if t.get("state") in {"active", "blocked", "awaiting_approval", "failed"}]
+    decisions = [
+        {
+            "decision_id": f"dec-{t['task_id']}",
+            "task_id": t["task_id"],
+            "agency": t.get("owner_agency"),
+            "title": t.get("title"),
+            "options": t.get("options") or [],
+            "recommended_option": t.get("recommended_option"),
+            "consequence_if_no_action": t.get("consequence_if_no_action"),
+            "deadline": t.get("due_at"),
+            "supporting_facts": t.get("summary") or t.get("expected_output"),
+        }
+        for t in active if t.get("decision_required")
+    ]
+    decision_path.write_text(json.dumps(decisions, indent=2))
+
+    wins = [t for t in latest_by_task.values() if t.get("state") == "completed"][-5:]
+    risks = [t for t in active if t.get("priority_band") in {"p0", "p1"}]
+    lines = ["# Daily Brief", "", "## Wins"]
+    lines += [f"- {t.get('title')} ({t.get('owner_agency')})" for t in wins] or ["- None"]
+    lines += ["", "## Risks"]
+    lines += [f"- {t.get('title')} [{t.get('state')}]" for t in risks] or ["- None"]
+    lines += ["", "## Next Recommended Actions"]
+    lines += [f"- {t.get('title')}" for t in active[:5]] or ["- None"]
+    brief_path.write_text("\n".join(lines) + "\n")
+
+    exception_events = []
+    if audit_path.exists():
+        for line in audit_path.read_text().splitlines()[-25:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            if event.get("event_type") in {"failure_logged", "policy_blocked", "decision_requested"}:
+                exception_events.append(event)
+    exception_path.write_text("\n".join(json.dumps(e) for e in exception_events[-10:]) + ("\n" if exception_events else ""))
+
+    return {
+        "decision_inbox_count": len(decisions),
+        "active_count": len(active),
+        "exception_count": len(exception_events[-10:]),
+    }
+
+
+def _force_marketplace_agency_run() -> dict:
+    task = append_task_record({
+        "task_id": "marketplace-live-run",
+        "title": "Run marketplace opportunity agency",
+        "owner_agency": "opportunity",
+        "assigned_agent": "APEX",
+        "source": "manual_execution",
+        "priority_band": "p1",
+        "priority_score": 91,
+        "state": "active",
+        "decision_required": False,
+        "expected_output": "Top 5 actionable local deals and source breakdown",
+        "linked_entities": ["marketplace-scraper", "marketplace-opportunity"],
+    })
+    append_audit_event("execution_started", "opportunity", "APEX", "Marketplace agency live run started", task_id=task["task_id"], rationale="Force live ingestion and bind outputs to agency path")
+
+    craigslist_imported = 0
+    ebay_imported = 0
+    craigslist_error = None
+    ebay_error = None
+
+    try:
+        craigslist_imported = asyncio.run(_run_craigslist_sched())
+    except Exception as exc:
+        craigslist_error = str(exc)
+        append_audit_event("failure_logged", "opportunity", "APEX", f"Craigslist run failed: {exc}", task_id=task["task_id"], rationale="Live ingestion failure")
+
+    try:
+        ebay_imported = asyncio.run(_run_ebay_sched())
+    except Exception as exc:
+        ebay_error = str(exc)
+        append_audit_event("failure_logged", "opportunity", "APEX", f"eBay run failed: {exc}", task_id=task["task_id"], rationale="Live ingestion failure")
+
+    rescore = _rescore_sync()
+    top_actions = TOP_ACTIONS_CACHE.get("top_actions") or []
+    source_counts = {}
+    for item in top_actions:
+        source = item.get("source") or "unknown"
+        source_counts[source] = source_counts.get(source, 0) + 1
+
+    run_summary = {
+        "craigslist_imported": craigslist_imported,
+        "ebay_imported": ebay_imported,
+        "craigslist_error": craigslist_error,
+        "ebay_error": ebay_error,
+        "rescored": rescore.get("rescored", 0),
+        "top_actions_count": len(top_actions),
+        "source_breakdown": [{"source": k, "count": v} for k, v in sorted(source_counts.items())],
+    }
+    _write_marketplace_agency_output(top_actions, run_summary)
+    append_task_state_change(task["task_id"], "completed", "opportunity", "APEX", "Marketplace agency live run completed", result=run_summary)
+    append_audit_event("execution_finished", "opportunity", "APEX", "Marketplace agency live run completed", task_id=task["task_id"], rationale="Outputs written to agency path", outputs_ref=[str(_agency_output_path())], run_summary=run_summary)
+
+    if not top_actions:
+        append_audit_event("decision_requested", "chief_of_staff", "APEX", "No actionable local marketplace deals found", task_id=task["task_id"], rationale="Need source/policy decision", decision_required=True)
+
+    executive = _refresh_executive_outputs()
+    return {
+        "task_id": task["task_id"],
+        "run_summary": run_summary,
+        "top_actions": top_actions[:TOP_DEALS_LIMIT],
+        "executive": executive,
+    }
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
@@ -1095,19 +1371,20 @@ def _rescore_sync() -> dict:
         except Exception as exc:
             logger.warning("Rescore failed for %s: %s", listing_id, exc)
 
-        if notifier.is_opportunity(clean):
+        if notifier.is_opportunity(clean) and _local_opportunity_allowed(clean):
             _upsert_opportunity(clean, listing_id)
             upserted += 1
             if notifier.maybe_alert(clean, listing_id, clean.get("action_score") or 0.0):
                 alerted += 1
 
-    top_docs = list(
-        scored_opportunities_col.find({"score": {"$gte": 70}})
-        .sort("score", DESCENDING).limit(200)
-    )
+    top_docs = [
+        doc for doc in scored_opportunities_col.find({"score": {"$gte": 70}})
+        .sort("score", DESCENDING).limit(300)
+        if _local_opportunity_allowed(doc)
+    ]
     top_actions, suppressed_count = action_engine.rank_top_actions([
         _serialize_opportunity(doc) for doc in top_docs
-    ], top_n=3)
+    ], top_n=TOP_DEALS_LIMIT)
     if notifier.maybe_alert_top3(top_actions, suppressed_count):
         alerted += 1
 
@@ -1116,6 +1393,10 @@ def _rescore_sync() -> dict:
         "suppressed_count": suppressed_count,
         "cached_at": datetime.now(timezone.utc).isoformat(),
     })
+
+    emit("top_deals_updated", "rescore", "Top deals updated",
+         f"Rescored {rescored} listings, {upserted} opportunities, top {len(top_actions)} actions",
+         metadata={"rescored": rescored, "upserted": upserted, "top_actions_count": len(top_actions)})
 
     _write_scored_json([{k: v for k, v in d.items() if k != "_id"} for d in top_docs])
     return {
@@ -1131,6 +1412,11 @@ def _rescore_sync() -> dict:
 def rescore_opportunities():
     """Scan all listings, upsert opportunities, send Telegram alerts for new high-score items."""
     return _rescore_sync()
+
+
+@app.post("/api/agencies/marketplace/run")
+def run_marketplace_agency():
+    return _force_marketplace_agency_run()
 
 
 @app.post("/api/opportunities/alert-test")
@@ -1175,7 +1461,8 @@ def _serialize_opportunity(doc: dict) -> dict:
         "confidence": _get_field(doc, "confidence"),
         "estimated_profit_low": _get_field(doc, "estimated_profit_low"),
         "effective_profit_after_travel": _get_field(doc, "effective_profit_after_travel"),
-        "distance_miles": _get_field(doc, "distance_miles"),
+        "estimated_value": _estimated_value(doc),
+        "distance_miles": _normalized_distance(doc),
         "travel_tier": _get_field(doc, "travel_tier", "unknown"),
         "listing_url": doc.get("listing_url", ""),
         "category": doc.get("category"),
@@ -1211,6 +1498,7 @@ def get_top_actions_brief(
         cached = TOP_ACTIONS_CACHE["top_actions"]
         if not include_examples:
             cached = [a for a in cached if a.get("source") != "seed_data"]
+        cached = [a for a in cached if _local_opportunity_allowed(a)]
         return {
             "top_actions": cached[:limit],
             "count": len(cached[:limit]),
@@ -1222,7 +1510,7 @@ def get_top_actions_brief(
     query: dict = {"score": {"$gte": min_score}}
     if not include_examples:
         query["source"] = {"$ne": "seed_data"}
-    docs = list(scored_opportunities_col.find(query).sort("score", DESCENDING).limit(300))
+    docs = [doc for doc in scored_opportunities_col.find(query).sort("score", DESCENDING).limit(300) if _local_opportunity_allowed(doc)]
     ranked, suppressed_count = action_engine.rank_top_actions(
         [_serialize_opportunity(doc) for doc in docs], top_n=limit
     )
@@ -1279,10 +1567,11 @@ def get_top_actions(
     if not include_examples:
         query["source"] = {"$ne": "seed_data"}
 
-    docs = list(
-        scored_opportunities_col.find(query)
+    docs = [
+        doc for doc in scored_opportunities_col.find(query)
         .sort("score", DESCENDING).limit(300)
-    )
+        if _local_opportunity_allowed(doc)
+    ]
     ranked, suppressed_count = action_engine.rank_top_actions(
         [_serialize_opportunity(doc) for doc in docs],
         top_n=limit,
@@ -1308,7 +1597,7 @@ def get_more_opportunities(
     if not include_examples:
         query["source"] = {"$ne": "seed_data"}
 
-    docs = [_serialize_opportunity(doc) for doc in scored_opportunities_col.find(query).sort("score", DESCENDING).limit(400)]
+    docs = [_serialize_opportunity(doc) for doc in scored_opportunities_col.find(query).sort("score", DESCENDING).limit(400) if _local_opportunity_allowed(doc)]
     ranked, _ = action_engine.rank_top_actions(docs, top_n=len(docs))
 
     if sort_by == "score":
@@ -1441,11 +1730,18 @@ def _get_recent_log(n: int = 10) -> list:
 
 async def _run_craigslist_sched() -> int:
     from scrapers.craigslist import scrape_craigslist as do_scrape
+    emit("scraper_started", "craigslist", "Craigslist scraper started",
+         f"Scraping {CRAIGSLIST_LOCATION}", metadata={"source": "craigslist"})
     result = await asyncio.to_thread(do_scrape, city=CRAIGSLIST_LOCATION, category="all", max_results=80)
     total = result.get("total_found", 0)
     imported, _ = await asyncio.to_thread(_process_batch, result.get("listings", []), "craigslist")
     _log_scrape_run("craigslist", total, imported, result.get("error"))
+    emit("scraper_finished", "craigslist", "Craigslist scraper finished",
+         f"Found {total}, imported {imported}", metadata={"source": "craigslist", "total": total, "imported": imported})
     if imported:
+        emit("deals_imported", "craigslist", f"{imported} new Craigslist deals",
+             f"Imported {imported} listings from craigslist",
+             metadata={"source": "craigslist", "count": imported})
         import_runs_col.insert_one({
             "source": "craigslist", "city": CRAIGSLIST_LOCATION,
             "count": imported, "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1613,6 +1909,9 @@ async def startup_event():
         )
         _write_scored_json([{k: v for k, v in d.items() if k != "_id"} for d in top])
 
+    emit("system_info", "system", "System started", "Pineapple OS online",
+         metadata={"version": "1.0.0"})
+
     # Launch background scrape scheduler
     # Staggered initial delays prevent all sources hammering at once on startup
     logger.info("Launching background scrape scheduler...")
@@ -1624,3 +1923,188 @@ async def startup_event():
     logger.info(
         "Scheduler running: craigslist=30m, govplanet=60m, publicsurplus=60m, facebook=45m, ebay=60m"
     )
+
+
+# ---------------------------------------------------------------------------
+# Operator Console — deal state, HTML renderer, endpoints
+# ---------------------------------------------------------------------------
+
+DEAL_STATES_FILE = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "deal_states.json"
+
+
+def _save_deal_state(listing_id: str, state: str) -> None:
+    states: dict = {}
+    if DEAL_STATES_FILE.exists():
+        try:
+            states = json.loads(DEAL_STATES_FILE.read_text())
+        except Exception:
+            pass
+    states[listing_id] = {"state": state, "ts": datetime.now(timezone.utc).isoformat()}
+    DEAL_STATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEAL_STATES_FILE.write_text(json.dumps(states, indent=2))
+
+
+def render_console_html(data: dict) -> str:
+    status       = data.get("system_status") or {}
+    generated_at = data.get("generated_at") or ""
+    total        = status.get("total_tracked") or 0
+    sources      = status.get("sources_active") or []
+    top_deals    = data.get("top_deals") or []
+    suppressed   = data.get("suppressed_count") or 0
+    recent_evts  = get_recent(10)
+
+    def deal_card(d: dict) -> str:
+        tier     = d.get("travel_tier") or "unknown"
+        cfo      = d.get("cfo_decision") or "rejected"
+        border   = "#22c55e" if (tier == "local" and cfo == "approved") else (
+                   "#eab308" if tier == "stretch" else "#ef4444")
+        title    = d.get("title") or "Untitled"
+        source   = d.get("source") or "?"
+        price    = d.get("price") or 0
+        profit   = d.get("effective_profit_after_travel") or d.get("estimated_profit") or 0
+        ppd      = d.get("profit_per_day") or 0
+        dist     = d.get("distance_miles")
+        score    = d.get("action_score") or 0
+        cos_act  = d.get("cos_action") or ""
+        url      = d.get("listing_url") or "#"
+        lid      = d.get("id") or ""
+        dist_str = f"{dist:.0f}mi" if dist is not None else "?mi"
+        tier_dot = {"local": "🟢", "stretch": "🟡", "far": "🔴"}.get(tier, "⚪")
+        return (
+            f'<div style="border-left:4px solid {border};background:#1a1a1a;padding:12px 16px;margin:8px 0;border-radius:4px">'
+            f'<div style="font-weight:700;font-size:15px">{title} <span style="color:#888;font-size:12px">({source})</span></div>'
+            f'<div style="margin:4px 0;color:#ccc">${price:,.0f} &rarr; <b style="color:#22c55e">${profit:,.0f} profit</b>'
+            f' &bull; ${ppd:.0f}/day &bull; {tier_dot} {dist_str} {tier}</div>'
+            f'<div style="color:#aaa;font-size:13px">Score:{score:.0f}</div>'
+            f'<div style="margin-top:6px;color:#facc15;font-size:13px"><b>👉 {cos_act}</b></div>'
+            f'<div style="margin-top:6px;font-size:12px">'
+            f'<a href="{url}" target="_blank" style="color:#60a5fa">View listing</a> &nbsp;'
+            f'<button onclick="fetch(\'/deal/{lid}/interested\',{{method:\'POST\'}}).then(()=>this.textContent=\'✅ Interested\')"'
+            f' style="background:#166534;color:#fff;border:none;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:12px">Interested</button>'
+            f'<button onclick="fetch(\'/deal/{lid}/dead\',{{method:\'POST\'}}).then(()=>this.textContent=\'💀 Dead\')"'
+            f' style="background:#7f1d1d;color:#fff;border:none;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:12px">Dead</button>'
+            f'</div></div>'
+        )
+
+    cards_html = "\n".join(deal_card(d) for d in top_deals) if top_deals else \
+        "<p style='color:#888'>No deals passed the pipeline right now.</p>"
+
+    def evt_row(e: dict) -> str:
+        sev   = e.get("severity") or "info"
+        color = {"info": "#22c55e", "warn": "#eab308", "error": "#ef4444", "critical": "#f97316"}.get(sev, "#aaa")
+        ts    = (e.get("ts") or "")[:19].replace("T", " ")
+        title = e.get("title") or ""
+        msg   = e.get("message") or ""
+        src   = e.get("source") or ""
+        return (
+            f'<div style="border-left:3px solid {color};padding:3px 8px;margin:3px 0;font-size:12px;color:#ccc">'
+            f'<span style="color:{color}">[{sev}]</span> '
+            f'<span style="color:#888">{ts}</span> <b>{src}</b>: {title} — {msg}</div>'
+        )
+
+    events_html = "\n".join(evt_row(e) for e in recent_evts) if recent_evts else \
+        "<p style='color:#555;font-size:12px'>No events yet.</p>"
+
+    sup_reasons = data.get("suppressed_reasons") or {}
+    sup_detail  = ", ".join(f"{v} {k.replace('_',' ')}" for k, v in sup_reasons.items() if v) or ""
+
+    return (
+        "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
+        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>\n"
+        "<title>🍍 Pineapple Operator Console</title>\n"
+        "<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0f0f0f;color:#f0f0f0;font-family:monospace;padding:20px}</style>\n"
+        "</head>\n<body>\n<div style='max-width:860px;margin:0 auto'>\n"
+        "<h1 style='font-size:22px;margin-bottom:4px'>🍍 PINEAPPLE OPERATOR CONSOLE</h1>\n"
+        f"<div style='color:#888;font-size:13px;margin-bottom:16px'>"
+        f"{generated_at[:19].replace('T',' ')} UTC &bull; {total} tracked &bull; "
+        f"{len(sources)} sources: {', '.join(sources)}</div>\n"
+        "<h2 style='font-size:15px;color:#facc15;margin-bottom:8px'>TOP DEALS</h2>\n"
+        f"{cards_html}\n"
+        f"<div style='margin-top:8px;color:#888;font-size:13px'>⛔ {suppressed} suppressed"
+        f"{' (' + sup_detail + ')' if sup_detail else ''} &nbsp;&bull;&nbsp;"
+        "<button onclick=\"fetch('/pipeline/run',{method:'POST'}).then(r=>r.json()).then(()=>location.reload())\""
+        " style='background:#1e3a5f;color:#fff;border:none;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:12px'>"
+        "▶ Run Pipeline</button></div>\n"
+        "<h2 style='font-size:15px;color:#facc15;margin:20px 0 8px'>LIVE EVENT FEED</h2>\n"
+        "<div id='feed' style='background:#111;border:1px solid #333;border-radius:4px;padding:8px;max-height:260px;overflow-y:auto'>\n"
+        f"{events_html}\n</div>\n</div>\n"
+        "<script>\n"
+        "const feed=document.getElementById('feed');\n"
+        "const es=new EventSource('/operator/events/stream');\n"
+        "es.onmessage=function(e){\n"
+        "  const ev=JSON.parse(e.data);\n"
+        "  const colors={info:'#22c55e',warn:'#eab308',error:'#ef4444',critical:'#f97316'};\n"
+        "  const c=colors[ev.severity]||'#aaa';\n"
+        "  const ts=(ev.ts||'').slice(0,19).replace('T',' ');\n"
+        "  const row=document.createElement('div');\n"
+        "  row.style.cssText=`border-left:3px solid ${c};padding:3px 8px;margin:3px 0;font-size:12px;color:#ccc`;\n"
+        "  row.innerHTML=`<span style='color:${c}'>[${ev.severity}]</span> <span style='color:#888'>${ts}</span> <b>${ev.source}</b>: ${ev.title} — ${ev.message}`;\n"
+        "  feed.insertBefore(row,feed.firstChild);\n"
+        "};\n"
+        "</script>\n</body>\n</html>"
+    )
+
+
+@app.get("/operator/console")
+async def operator_console(format: str = "json"):
+    data = await asyncio.to_thread(build_console_data, scored_opportunities_col)
+    if format == "html":
+        return HTMLResponse(content=render_console_html(data))
+    return data
+
+
+@app.get("/operator/events/stream")
+async def events_stream(request: Request):
+    q: asyncio.Queue = asyncio.Queue()
+    register_sse_queue(q)
+
+    async def generator():
+        try:
+            for e in get_recent(20):
+                yield f"data: {json.dumps(e)}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            unregister_sse_queue(q)
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/operator/events/recent")
+async def recent_events(limit: int = 100):
+    capped = min(limit, 500)
+    return {"events": get_recent(capped), "count": capped}
+
+
+@app.post("/deal/{listing_id}/interested")
+async def mark_interested(listing_id: str):
+    _save_deal_state(listing_id, "interested")
+    emit("action_triggered", "user", "Marked interested", listing_id,
+         metadata={"listing_id": listing_id, "state": "interested"})
+    return {"ok": True, "listing_id": listing_id, "state": "interested"}
+
+
+@app.post("/deal/{listing_id}/dead")
+async def mark_dead(listing_id: str):
+    _save_deal_state(listing_id, "dead")
+    emit("action_triggered", "user", "Marked dead", listing_id,
+         metadata={"listing_id": listing_id, "state": "dead"})
+    return {"ok": True, "listing_id": listing_id, "state": "dead"}
+
+
+@app.post("/pipeline/run")
+async def run_pipeline():
+    emit("pipeline_run", "user", "Manual pipeline triggered", "Running full rescore + console refresh")
+    await asyncio.to_thread(_rescore_sync)
+    data = await asyncio.to_thread(build_console_data, scored_opportunities_col)
+    return {"triggered": True, "console": data}
