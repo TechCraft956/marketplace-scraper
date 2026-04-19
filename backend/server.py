@@ -59,6 +59,8 @@ scored_opportunities_col.create_index([("score", DESCENDING)])
 scored_opportunities_col.create_index("listing_id", unique=True, sparse=True)
 
 SCORED_JSON_PATH = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "scored.json"
+
+TOP_ACTIONS_CACHE: dict = {"top_actions": [], "suppressed_count": 0, "cached_at": None}
 SCRAPE_LOG_PATH  = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "scrape_log.json"
 FB_COOKIES_PATH  = Path(os.environ.get("FB_COOKIES_PATH", "/app/cookies/fb_cookies.json"))
 
@@ -975,6 +977,12 @@ def _rescore_sync() -> dict:
     if notifier.maybe_alert_top3(top_actions, suppressed_count):
         alerted += 1
 
+    TOP_ACTIONS_CACHE.update({
+        "top_actions": top_actions,
+        "suppressed_count": suppressed_count,
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+    })
+
     _write_scored_json([{k: v for k, v in d.items() if k != "_id"} for d in top_docs])
     return {
         "rescored": rescored,
@@ -1048,6 +1056,7 @@ def _serialize_opportunity(doc: dict) -> dict:
         "friction_score",
         "friction_reasons",
         "reason_to_act",
+        "risk_flag",
         "rank",
         "why_ranked_here",
     ):
@@ -1055,6 +1064,41 @@ def _serialize_opportunity(doc: dict) -> dict:
             payload[key] = doc.get(key)
 
     return payload
+
+
+@app.get("/opportunities/top-actions")
+def get_top_actions_brief(
+    limit: int = Query(5, ge=1, le=25),
+    min_score: float = Query(70, ge=0, le=100),
+    include_examples: bool = Query(False),
+):
+    """Return top actions from cache (populated by rescore) or fall back to DB query."""
+    if TOP_ACTIONS_CACHE.get("cached_at") and TOP_ACTIONS_CACHE.get("top_actions") is not None:
+        cached = TOP_ACTIONS_CACHE["top_actions"]
+        if not include_examples:
+            cached = [a for a in cached if a.get("source") != "seed_data"]
+        return {
+            "top_actions": cached[:limit],
+            "count": len(cached[:limit]),
+            "suppressed_count": TOP_ACTIONS_CACHE.get("suppressed_count", 0),
+            "cached_at": TOP_ACTIONS_CACHE.get("cached_at"),
+            "min_score": min_score,
+        }
+
+    query: dict = {"score": {"$gte": min_score}}
+    if not include_examples:
+        query["source"] = {"$ne": "seed_data"}
+    docs = list(scored_opportunities_col.find(query).sort("score", DESCENDING).limit(300))
+    ranked, suppressed_count = action_engine.rank_top_actions(
+        [_serialize_opportunity(doc) for doc in docs], top_n=limit
+    )
+    return {
+        "top_actions": ranked,
+        "count": len(ranked),
+        "suppressed_count": suppressed_count,
+        "cached_at": None,
+        "min_score": min_score,
+    }
 
 
 @app.get("/opportunities/local-best")

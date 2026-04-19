@@ -133,6 +133,14 @@ def _friction(listing: dict) -> tuple[float, list[str]]:
     return min(total, 30.0), reasons
 
 
+def _risk_flag(confidence: float, travel_tier: str, friction_score: float) -> str:
+    if confidence > 0.7 and travel_tier == "local" and friction_score < 5:
+        return "low"
+    if confidence < 0.5 or friction_score >= 15 or travel_tier == "far":
+        return "high"
+    return "medium"
+
+
 def _reason_to_act(listing: dict, effective_profit: float, travel_tier: str,
                    confidence: float, ppd: float) -> str:
     signals: list[str] = []
@@ -208,6 +216,8 @@ def compute_action_score(listing: dict) -> dict:
         "friction_score":    round(friction_score, 1),
         "friction_reasons":  friction_reasons,
         "reason_to_act":     _reason_to_act(listing, effective_profit, travel_tier, confidence, ppd),
+        "why_ranked_here":   "",
+        "risk_flag":         _risk_flag(confidence, travel_tier, friction_score),
     }
 
 
