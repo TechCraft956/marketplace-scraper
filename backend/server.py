@@ -19,6 +19,7 @@ import action_engine
 from task_audit import append_task_record, append_task_state_change, append_audit_event
 from events import emit, get_recent, register_sse_queue, unregister_sse_queue
 from operator_console import build_console_data
+from contact_drafter import save_draft, get_drafts, mark_draft, DRAFT_SCORE_THRESHOLD
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -333,9 +334,8 @@ DEPRIORITIZED_SOURCES = {"publicsurplus", "govplanet"}
 TOP_TIER_LOCAL_DISTANCE = 50.0
 STRETCH_LOCAL_DISTANCE = 100.0
 VERY_HIGH_SCORE_THRESHOLD = 110.0
-HIGH_DEPRITIZED_SCORE = 120.0
+HIGH_DEPRIORITIZED_SCORE = 120.0
 TOP_DEALS_LIMIT = 3
-CRAIGSLIST_RUNTIME_CITY = os.environ.get("CRAIGSLIST_LOCATION", "sfbay")
 
 
 def _normalize_source(value: Optional[str]) -> str:
@@ -361,64 +361,12 @@ def _source_allowed(listing: dict) -> bool:
     score = float(listing.get("score") or 0)
     distance = _normalized_distance(listing)
     if source == "publicsurplus":
-        return score >= HIGH_DEPRITIZED_SCORE and distance is not None and distance <= STRETCH_LOCAL_DISTANCE
+        return score >= HIGH_DEPRIORITIZED_SCORE and distance is not None and distance <= STRETCH_LOCAL_DISTANCE
     if source == "govplanet":
         return distance is not None and distance <= STRETCH_LOCAL_DISTANCE and score >= VERY_HIGH_SCORE_THRESHOLD
     return False
 
 
-
-
-def _normalize_marketplace_location(listing: dict) -> None:
-    location = (listing.get("location") or "").strip()
-    title = (listing.get("title") or "").strip()
-    if not location and title:
-        tail = re.sub(r".*\$(?:\d[\d,]*(?:\.\d+)?)", "", title).strip(" -,")
-        if tail and len(tail) > 1:
-            location = tail
-    if location:
-        location = re.sub(r"\s+", " ", location).strip()
-        listing["location"] = location
-
-
-def _apply_craigslist_locality(listing: dict) -> None:
-    if (listing.get("source") or "").lower() != "craigslist":
-        return
-    _normalize_marketplace_location(listing)
-    if listing.get("distance_miles") is not None:
-        return
-    location = (listing.get("location") or "").lower()
-    if not location:
-        listing["travel_tier"] = listing.get("travel_tier") or "unknown"
-        return
-    local_markers = ["san francisco", "oakland", "berkeley", "daly city", "south san francisco", "burlingame", "san mateo", "redwood city", "palo alto", "mountain view", "san jose", "fremont", "hayward", "santa clara", "sunnyvale"]
-    stretch_markers = ["santa rosa", "napa", "sonoma", "sacramento", "stockton", "modesto", "monterey", "salinas", "santa cruz"]
-    if any(marker in location for marker in local_markers):
-        listing["distance_miles"] = 25.0
-        listing["travel_tier"] = "local"
-    elif any(marker in location for marker in stretch_markers):
-        listing["distance_miles"] = 85.0
-        listing["travel_tier"] = "stretch"
-    elif listing.get("travel_tier") in (None, "unknown"):
-        listing["travel_tier"] = "unknown"
-
-
-def _finalize_candidate(listing: dict) -> dict:
-    item = dict(listing)
-    _normalize_marketplace_location(item)
-    _apply_craigslist_locality(item)
-    if item.get("estimated_value") is None:
-        item["estimated_value"] = _estimated_value(item)
-    if not item.get("reason_to_act"):
-        label = item.get("signal_label") or _signal_label(item)
-        reasons = {
-            "local_actionable": "local price/value mismatch worth acting on now",
-            "local_watch": "local candidate worth watching",
-            "stretch_candidate": "stretch-distance candidate with some resale upside",
-            "weak_signal": "best available candidate in a weak run",
-        }
-        item["reason_to_act"] = reasons.get(label, "best available candidate")
-    return item
 def _quality_allowed(listing: dict) -> bool:
     title = (listing.get("title") or "").strip()
     if not title:
@@ -519,11 +467,7 @@ def _candidate_rank_tuple(listing: dict):
 
 
 def _select_marketplace_candidates(top_actions: list[dict], fallback_docs: list[dict]) -> tuple[list[dict], bool]:
-    actionable = []
-    for item in top_actions:
-        enriched = _finalize_candidate(item)
-        if _local_opportunity_allowed(enriched):
-            actionable.append(enriched)
+    actionable = [item for item in top_actions if _local_opportunity_allowed(item)]
     if actionable:
         selected = actionable[:TOP_DEALS_LIMIT]
         for item in selected:
@@ -532,11 +476,11 @@ def _select_marketplace_candidates(top_actions: list[dict], fallback_docs: list[
 
     fallback = []
     for item in top_actions + fallback_docs:
-        enriched = _finalize_candidate(item)
-        if not _source_allowed(enriched):
+        if not _source_allowed(item):
             continue
-        if not _quality_allowed(enriched):
+        if not _quality_allowed(item):
             continue
+        enriched = dict(item)
         enriched["signal_label"] = _signal_label(enriched)
         fallback.append(enriched)
 
@@ -1184,11 +1128,11 @@ async def import_screenshot(file: UploadFile = File(...)):
 
 from pydantic import BaseModel
 
-CRAIGSLIST_LOCATION = os.environ.get("CRAIGSLIST_LOCATION", "sfbay")
+CRAIGSLIST_LOCATIONS = [l.strip() for l in os.environ.get("CRAIGSLIST_LOCATION", "sfbay").split(",") if l.strip()]
 
 
 class CraigslistScrapeRequest(BaseModel):
-    city: Optional[str] = None   # falls back to CRAIGSLIST_LOCATION env var
+    city: Optional[str] = None   # falls back to first CRAIGSLIST_LOCATIONS entry
     query: str = ""
     category: str = "all"
     min_price: Optional[float] = None
@@ -1202,7 +1146,7 @@ class CraigslistScrapeRequest(BaseModel):
 def scrape_craigslist_endpoint(req: CraigslistScrapeRequest):
     from scrapers.craigslist import scrape_craigslist as do_scrape
 
-    city = req.city or CRAIGSLIST_LOCATION
+    city = req.city or CRAIGSLIST_LOCATIONS[0]
 
     result = do_scrape(
         city=city,
@@ -1452,7 +1396,7 @@ def scrape_craigslist_rss_endpoint(req: CraigslistRssScrapeRequest):
             skipped += 1
 
     import_runs_col.insert_one({
-        "source": "craigslist_rss", "city": req.city or CRAIGSLIST_LOCATION,
+        "source": "craigslist_rss", "city": req.city or CRAIGSLIST_LOCATIONS[0],
         "category": req.category, "count": imported, "skipped": skipped,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -1533,7 +1477,7 @@ def get_opportunities(
 def _rescore_sync() -> dict:
     """Rescore all active listings, refresh opportunities, and emit only Top 3 action briefings by default."""
     cursor = listings_col.find()
-    upserted = alerted = rescored = 0
+    upserted = alerted = rescored = drafted = 0
     for doc in cursor:
         listing_id = str(doc["_id"])
         clean = {k: v for k, v in doc.items() if k != "_id"}
@@ -1557,6 +1501,18 @@ def _rescore_sync() -> dict:
             rescored += 1
         except Exception as exc:
             logger.warning("Rescore failed for %s: %s", listing_id, exc)
+
+        if (clean.get("score") or 0) >= DRAFT_SCORE_THRESHOLD:
+            try:
+                entry = save_draft(clean, listing_id)
+                if entry:
+                    drafted += 1
+                    emit("action_triggered", "drafter",
+                         f"Draft ready: {(clean.get('title') or '?')[:40]}",
+                         entry["draft_preview"],
+                         metadata={"listing_id": listing_id, "score": clean.get("score")})
+            except Exception as exc:
+                logger.warning("Draft generation failed for %s: %s", listing_id, exc)
 
         if notifier.is_opportunity(clean) and _local_opportunity_allowed(clean):
             _upsert_opportunity(clean, listing_id)
@@ -1590,6 +1546,7 @@ def _rescore_sync() -> dict:
         "rescored": rescored,
         "upserted": upserted,
         "alerted": alerted,
+        "drafted": drafted,
         "top_actions_count": len(top_actions),
         "suppressed_count": suppressed_count,
     }
@@ -1917,23 +1874,31 @@ def _get_recent_log(n: int = 10) -> list:
 
 async def _run_craigslist_sched() -> int:
     from scrapers.craigslist import scrape_craigslist as do_scrape
+    locations_str = ",".join(CRAIGSLIST_LOCATIONS)
     emit("scraper_started", "craigslist", "Craigslist scraper started",
-         f"Scraping {CRAIGSLIST_LOCATION}", metadata={"source": "craigslist"})
-    result = await asyncio.to_thread(do_scrape, city=CRAIGSLIST_LOCATION, category="all", max_results=80)
-    total = result.get("total_found", 0)
-    imported, _ = await asyncio.to_thread(_process_batch, result.get("listings", []), "craigslist")
-    _log_scrape_run("craigslist", total, imported, result.get("error"))
+         f"Scraping {locations_str}", metadata={"source": "craigslist"})
+    total_all = 0
+    imported_all = 0
+    for city in CRAIGSLIST_LOCATIONS:
+        result = await asyncio.to_thread(do_scrape, city=city, category="all", max_results=80)
+        total = result.get("total_found", 0)
+        imported, _ = await asyncio.to_thread(_process_batch, result.get("listings", []), "craigslist")
+        _log_scrape_run("craigslist", total, imported, result.get("error"))
+        if imported:
+            import_runs_col.insert_one({
+                "source": "craigslist", "city": city,
+                "count": imported, "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+        total_all += total
+        imported_all += imported
     emit("scraper_finished", "craigslist", "Craigslist scraper finished",
-         f"Found {total}, imported {imported}", metadata={"source": "craigslist", "total": total, "imported": imported})
-    if imported:
-        emit("deals_imported", "craigslist", f"{imported} new Craigslist deals",
-             f"Imported {imported} listings from craigslist",
-             metadata={"source": "craigslist", "count": imported})
-        import_runs_col.insert_one({
-            "source": "craigslist", "city": CRAIGSLIST_LOCATION,
-            "count": imported, "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-    return imported
+         f"Found {total_all}, imported {imported_all} across {len(CRAIGSLIST_LOCATIONS)} locations",
+         metadata={"source": "craigslist", "total": total_all, "imported": imported_all})
+    if imported_all:
+        emit("deals_imported", "craigslist", f"{imported_all} new Craigslist deals",
+             f"Imported {imported_all} listings from craigslist ({locations_str})",
+             metadata={"source": "craigslist", "count": imported_all})
+    return imported_all
 
 
 async def _run_govplanet_sched() -> int:
@@ -2195,6 +2160,54 @@ def render_console_html(data: dict) -> str:
     sup_reasons = data.get("suppressed_reasons") or {}
     sup_detail  = ", ".join(f"{v} {k.replace('_',' ')}" for k, v in sup_reasons.items() if v) or ""
 
+    pending_drafts = []
+    try:
+        pending_drafts = get_drafts("draft")
+    except Exception:
+        pass
+
+    def draft_card(d: dict) -> str:
+        lid      = d.get("listing_id") or ""
+        title    = d.get("title") or "Untitled"
+        source   = d.get("source") or "?"
+        price    = d.get("price") or 0
+        offer    = d.get("offer_price") or 0
+        score    = d.get("score") or 0
+        url      = d.get("listing_url") or "#"
+        text     = (d.get("draft_text") or d.get("draft_preview") or "").replace("'", "\\'").replace("\n", " ")
+        return (
+            f'<div style="background:#141a14;border:1px solid #2d4a2d;border-radius:4px;padding:10px 14px;margin:6px 0">'
+            f'<div style="font-weight:700;font-size:14px">{title} '
+            f'<span style="color:#888;font-size:12px">({source})</span> '
+            f'<span style="color:#22c55e;font-size:12px">score:{score:.0f}</span></div>'
+            f'<div style="color:#aaa;font-size:13px;margin:3px 0">${price:,.0f} asking → offer ${offer:,.0f}</div>'
+            f'<div style="background:#0d1a0d;border:1px solid #1a3a1a;border-radius:3px;padding:6px 8px;margin:6px 0;'
+            f'font-size:13px;color:#d4edda;font-style:italic">{d.get("draft_text") or d.get("draft_preview") or ""}</div>'
+            f'<div style="font-size:12px;margin-top:4px">'
+            f'<a href="{url}" target="_blank" style="color:#60a5fa">View listing</a> &nbsp;'
+            f'<button onclick="navigator.clipboard.writeText(\'{text}\').then(()=>this.textContent=\'✅ Copied\')"'
+            f' style="background:#14532d;color:#fff;border:none;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:12px">Copy</button>'
+            f' &nbsp;'
+            f'<button onclick="fetch(\'/operator/drafts/{lid}/mark?status=sent\',{{method:\'POST\'}}).then(()=>this.closest(\'div[data-lid]\').remove())"'
+            f' style="background:#1e3a5f;color:#fff;border:none;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:12px">Mark Sent</button>'
+            f' &nbsp;'
+            f'<button onclick="fetch(\'/operator/drafts/{lid}/mark?status=skipped\',{{method:\'POST\'}}).then(()=>this.closest(\'div[data-lid]\').remove())"'
+            f' style="background:#3a1a1a;color:#fff;border:none;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:12px">Skip</button>'
+            f'</div></div>'
+        )
+
+    if pending_drafts:
+        drafts_html = "\n".join(draft_card(d) for d in pending_drafts[:10])
+        drafts_section = (
+            f"<h2 style='font-size:15px;color:#22c55e;margin:20px 0 8px'>✉️ DRAFTS READY ({len(pending_drafts)})</h2>\n"
+            f"{drafts_html}\n"
+        )
+    else:
+        drafts_section = (
+            "<h2 style='font-size:15px;color:#22c55e;margin:20px 0 8px'>✉️ DRAFTS READY</h2>\n"
+            "<p style='color:#555;font-size:13px'>No pending drafts. Run pipeline to generate contact scripts for high-score deals.</p>\n"
+        )
+
     return (
         "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
         "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>\n"
@@ -2212,6 +2225,7 @@ def render_console_html(data: dict) -> str:
         "<button onclick=\"fetch('/pipeline/run',{method:'POST'}).then(r=>r.json()).then(()=>location.reload())\""
         " style='background:#1e3a5f;color:#fff;border:none;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:12px'>"
         "▶ Run Pipeline</button></div>\n"
+        f"{drafts_section}"
         "<h2 style='font-size:15px;color:#facc15;margin:20px 0 8px'>LIVE EVENT FEED</h2>\n"
         "<div id='feed' style='background:#111;border:1px solid #333;border-radius:4px;padding:8px;max-height:260px;overflow-y:auto'>\n"
         f"{events_html}\n</div>\n</div>\n"
@@ -2295,3 +2309,17 @@ async def run_pipeline():
     await asyncio.to_thread(_rescore_sync)
     data = await asyncio.to_thread(build_console_data, scored_opportunities_col)
     return {"triggered": True, "console": data}
+
+
+@app.get("/operator/drafts")
+async def operator_drafts(status: str = "draft"):
+    drafts = await asyncio.to_thread(get_drafts, status)
+    return {"drafts": drafts, "count": len(drafts), "status_filter": status}
+
+
+@app.post("/operator/drafts/{listing_id}/mark")
+async def mark_draft_status(listing_id: str, status: str = "sent"):
+    ok = await asyncio.to_thread(mark_draft, listing_id, status)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return {"ok": True, "listing_id": listing_id, "status": status}

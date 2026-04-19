@@ -64,6 +64,12 @@ CL_CITIES = {
     "sacramento": "sacramento",
     "nashville": "nashville",
     "raleigh": "raleigh",
+    # RGV / South Texas
+    "mcallen": "mcallen",
+    "laredo": "laredo",
+    "corpuschristi": "corpuschristi",
+    "harlingen": "harlingen",
+    "brownsville": "brownsville",
 }
 
 

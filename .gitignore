@@ -42,6 +42,9 @@ fb_cookies.json
 .env
 .env.local
 
+# Operator contact drafts — personal, not for version control
+operator-data/drafts/
+
 # Testing
 .pytest_cache/
 .coverage

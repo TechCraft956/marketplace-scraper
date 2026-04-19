@@ -30,6 +30,8 @@ services:
       - ./data/cookies:/app/cookies
       # SQLite fallback storage and any module output
       - ./data/storage:/app/storage
+      # Operator data — contact drafts, deal notes (gitignored)
+      - ./operator-data:/app/operator-data
       # Host-bound operator runtime outputs
       - /Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime:/Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime
     depends_on:
