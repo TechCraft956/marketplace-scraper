@@ -11,6 +11,7 @@ Deduplicates via /app/storage/alerted_ids.json (persisted across restarts).
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -22,6 +23,12 @@ TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
 ALERT_SCORE_THRESHOLD: float = float(os.environ.get("ALERT_SCORE_THRESHOLD", "70"))
 STORAGE_PATH: Path = Path(os.environ.get("STORAGE_PATH", "/app/storage"))
 ALERTED_IDS_FILE: Path = STORAGE_PATH / "alerted_ids.json"
+TOP3_STATE_FILE: Path = STORAGE_PATH / "top3_alerted_ids.json"
+
+# Per-listing maybe_alert only fires at this action_score threshold (truly exceptional)
+EXCEPTIONAL_ACTION_SCORE: float = 90.0
+# Minimum seconds between top3 briefings
+TOP3_COOLDOWN_SECS: int = 3600
 
 
 def _get(listing: dict, field: str, default=None):
@@ -85,6 +92,22 @@ def _save_alerted_ids(ids: set) -> None:
     STORAGE_PATH.mkdir(parents=True, exist_ok=True)
     with open(ALERTED_IDS_FILE, "w") as f:
         json.dump(sorted(ids), f, indent=2)
+
+
+def _load_top3_state() -> dict:
+    if TOP3_STATE_FILE.exists():
+        try:
+            with open(TOP3_STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_sent": 0.0, "alerted_ids": []}
+
+
+def _save_top3_state(state: dict) -> None:
+    STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+    with open(TOP3_STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 def format_alert(listing: dict) -> str:
@@ -162,11 +185,13 @@ def _send_telegram(message: str) -> bool:
     return False
 
 
-def maybe_alert(listing: dict, listing_id: str) -> bool:
-    """Send alert if opportunity criteria met and listing not already alerted.
+def maybe_alert(listing: dict, listing_id: str, action_score: float = 0.0) -> bool:
+    """Send per-listing alert only for truly exceptional deals (action_score >= 90).
 
     Returns True if alert was sent.
     """
+    if action_score < EXCEPTIONAL_ACTION_SCORE:
+        return False
     if not is_opportunity(listing):
         return False
     alerted = _load_alerted_ids()
@@ -183,3 +208,97 @@ def maybe_alert(listing: dict, listing_id: str) -> bool:
 def send_test_alert(listing: dict) -> bool:
     """Send alert bypassing deduplication — for /api/opportunities/alert-test."""
     return _send_telegram(format_alert(listing))
+
+
+def _format_top3_move(rank: int, item: dict) -> str:
+    medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, "🏅")
+    rank_label = {1: "#1 MOVE", 2: "#2 MOVE", 3: "#3 MOVE"}.get(rank, f"#{rank} MOVE")
+
+    title = item.get("title", "Unknown")
+    price = item.get("price")
+    price_str = f"${price:,.0f}" if price is not None else "N/A"
+
+    effective_profit = _get(item, "effective_profit_after_travel") or 0
+    profit_str = f"${effective_profit:,.0f}" if effective_profit else "N/A"
+
+    ppd = item.get("profit_per_day") or 0
+    ppd_str = f"${ppd:,.0f}/day" if ppd else "N/A"
+
+    travel_tier = _get(item, "travel_tier", "unknown") or "unknown"
+    tier_emoji = {"local": "🟢", "stretch": "🟡", "far": "🔴"}.get(travel_tier, "⚪")
+    tier_label = travel_tier.capitalize()
+
+    confidence = _get(item, "confidence") or 0
+    conf_str = f"{confidence:.2f}"
+
+    reason = item.get("reason_to_act", "")
+    url = item.get("listing_url", "")
+
+    lines = [
+        f"{medal} <b>{rank_label}</b>",
+        f"<b>{title}</b>",
+        f"💰 {price_str} → est. flip {profit_str} (after travel)",
+        f"📈 {ppd_str} | {tier_emoji} {tier_label} | Conf: {conf_str}",
+        f"✅ {reason}",
+    ]
+    if url:
+        lines.append(f'🔗 <a href="{url}">View Listing</a>')
+    return "\n".join(lines)
+
+
+def format_top3_briefing(top_actions: list[dict], suppressed_count: int) -> str:
+    """Format the combined operator briefing message."""
+    lines = ["🏆 <b>OPERATOR BRIEFING — Top Moves Right Now</b>", ""]
+    for item in top_actions:
+        rank = item.get("rank", 0)
+        lines.append(_format_top3_move(rank, item))
+        lines.append("")
+    lines.append(f"⚡ {suppressed_count} other deals tracked. Only the best made it.")
+    return "\n".join(lines)
+
+
+def maybe_alert_top3(top_actions: list[dict], suppressed_count: int = 0) -> bool:
+    """Fire ONE combined Telegram briefing when the top 3 refreshes with new listings.
+
+    Deduplicates by listing_id. Rate-limited to once per hour.
+    Returns True if message was sent.
+    """
+    if not top_actions:
+        return False
+
+    state = _load_top3_state()
+    alerted_ids: set[str] = set(state.get("alerted_ids", []))
+    last_sent: float = float(state.get("last_sent", 0))
+
+    # Extract IDs from current top 3
+    current_ids: list[str] = []
+    for item in top_actions:
+        lid = (
+            item.get("listing_id")
+            or item.get("id")
+            or str(item.get("_id", ""))
+        )
+        if lid:
+            current_ids.append(lid)
+
+    # Check if at least one new listing
+    has_new = any(lid not in alerted_ids for lid in current_ids if lid)
+    if not has_new:
+        logger.info("top3 briefing: no new listings, suppressing")
+        return False
+
+    # Enforce rate limit
+    now = time.time()
+    if now - last_sent < TOP3_COOLDOWN_SECS:
+        remaining = int(TOP3_COOLDOWN_SECS - (now - last_sent))
+        logger.info("top3 briefing: rate-limited, %ds remaining", remaining)
+        return False
+
+    message = format_top3_briefing(top_actions, suppressed_count)
+    sent = _send_telegram(message)
+
+    if sent:
+        alerted_ids.update(lid for lid in current_ids if lid)
+        _save_top3_state({"last_sent": now, "alerted_ids": sorted(alerted_ids)})
+        logger.info("top3 briefing sent (ids: %s)", current_ids)
+    return sent

@@ -11,8 +11,10 @@ Orchestrates: scraper → scorer → filter → storage → surface
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncGenerator, Optional, Type
 
 from .config_schema import MarketplaceScraperConfig
@@ -147,8 +149,35 @@ class MarketplaceScraperModule:
             # Build proxy config if set
             proxy = cfg.proxy_config  # Returns None if not configured
 
-            # Launch scraper
+            # Guard: skip FB source entirely if cookies are missing or empty.
+            # Pipeline continues — other sources (Craigslist, GovPlanet, imports) are unaffected.
             raw_listings: list[dict[str, Any]] = []
+            cookies_file = Path(cfg.cookies_path)
+            cookies_ok = False
+            if not cookies_file.exists():
+                logger.warning(
+                    "FB cookies file not found at %s — skipping Facebook source.",
+                    cfg.cookies_path,
+                )
+            else:
+                try:
+                    cookie_data = json.loads(cookies_file.read_text())
+                    if not cookie_data:
+                        raise ValueError("empty list")
+                    cookies_ok = True
+                except Exception as exc:
+                    logger.warning(
+                        "FB cookies at %s empty/invalid (%s) — skipping Facebook source.",
+                        cfg.cookies_path, exc,
+                    )
+
+            if not cookies_ok:
+                await self.storage.complete_run(
+                    run_id=run_id, total_scraped=0, total_after_filter=0,
+                    total_stored=0, new_listings=0, status="skipped_no_cookies",
+                )
+                self._is_scraping = False
+                return {"skipped": True, "reason": "no_cookies", "path": str(cookies_file)}
 
             async with PlaywrightScraper(
                 cookies_path=cfg.cookies_path,

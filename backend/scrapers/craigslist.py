@@ -23,22 +23,27 @@ USER_AGENTS = [
 
 # Craigslist category slugs
 CL_CATEGORIES = {
-    "all": "sss",          # all for sale
-    "vehicles": "cta",     # cars+trucks
-    "motorcycles": "mca",  # motorcycles
-    "electronics": "ela",  # electronics
-    "furniture": "fua",    # furniture
-    "tools": "tla",        # tools
+    "all": "sss",              # all for sale
+    "vehicles": "cta",         # cars+trucks
+    "cars-trucks": "cta",      # alias
+    "motorcycles": "mca",      # motorcycles
+    "electronics": "ela",      # electronics
+    "furniture": "fua",        # furniture
+    "tools": "tla",            # tools
     "heavy_equipment": "hva",  # heavy equipment
-    "trailers": "tra",     # trailers
-    "boats": "bpa",        # boats
-    "atvs": "sna",         # atvs/utvs/snowmobiles
-    "farm": "gra",         # farm+garden
-    "free": "zip",         # free stuff
+    "trailers": "tra",         # trailers
+    "boats": "bpa",            # boats
+    "atvs": "sna",             # atvs/utvs/snowmobiles
+    "farm": "gra",             # farm+garden
+    "free": "zip",             # free stuff
+    "general": "sss",          # general for-sale (alias)
+    "for-sale": "sss",         # general for-sale (alias)
 }
 
 # Major Craigslist city subdomains
+# Default location is read from CRAIGSLIST_LOCATION env var (see server.py endpoint)
 CL_CITIES = {
+    "sfbay": "sfbay",
     "austin": "austin",
     "houston": "houston",
     "dallas": "dallas",
