@@ -75,6 +75,53 @@ SCHEDULER_STATUS: dict = {
 }
 
 
+def _inspect_facebook_cookies() -> dict:
+    state = {
+        "path": str(FB_COOKIES_PATH),
+        "present": FB_COOKIES_PATH.exists(),
+        "valid": False,
+        "expired": False,
+        "cookie_count": 0,
+        "missing_required": [],
+        "message": None,
+    }
+    if not state["present"]:
+        state["message"] = "missing_cookies"
+        return state
+
+    try:
+        cookie_data = json.loads(FB_COOKIES_PATH.read_text())
+        if not isinstance(cookie_data, list) or not cookie_data:
+            raise ValueError("empty list")
+    except Exception as exc:
+        state["message"] = f"invalid_cookies: {exc}"
+        return state
+
+    state["cookie_count"] = len(cookie_data)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    names = {str(item.get("name", "")) for item in cookie_data if isinstance(item, dict)}
+    required = [name for name in ("c_user", "xs") if name not in names]
+    expiries = [
+        float(item["expires"])
+        for item in cookie_data
+        if isinstance(item, dict) and item.get("expires") not in (None, -1, "")
+    ]
+
+    state["missing_required"] = required
+    if required:
+        state["message"] = f"missing_required_cookies: {', '.join(required)}"
+        return state
+
+    if expiries and max(expiries) < now_ts:
+        state["expired"] = True
+        state["message"] = "expired_cookies"
+        return state
+
+    state["valid"] = True
+    state["message"] = "ready"
+    return state
+
+
 # ---------------------------------------------------------------------------
 # Extended price references for priority categories
 # ---------------------------------------------------------------------------
@@ -1356,18 +1403,13 @@ async def _run_publicsurplus_sched() -> int:
 
 
 async def _run_facebook_sched() -> int:
-    if not FB_COOKIES_PATH.exists():
-        logger.info("FB scheduler: cookies not at %s — skipping", FB_COOKIES_PATH)
-        SCHEDULER_STATUS["facebook"]["last_error"] = "no_cookies"
-        _log_scrape_run("facebook", 0, 0, "no_cookies")
-        return 0
-    try:
-        cookie_data = json.loads(FB_COOKIES_PATH.read_text())
-        if not cookie_data:
-            raise ValueError("empty list")
-    except Exception as exc:
-        SCHEDULER_STATUS["facebook"]["last_error"] = f"invalid_cookies: {exc}"
-        _log_scrape_run("facebook", 0, 0, f"invalid_cookies: {exc}")
+    cookie_state = _inspect_facebook_cookies()
+    SCHEDULER_STATUS["facebook"]["auth"] = cookie_state
+    if not cookie_state["valid"]:
+        reason = cookie_state["message"] or "invalid_cookies"
+        logger.warning("FB scheduler blocked: %s (path=%s)", reason, FB_COOKIES_PATH)
+        SCHEDULER_STATUS["facebook"]["last_error"] = reason
+        _log_scrape_run("facebook", 0, 0, reason)
         return 0
     try:
         from modules.marketplace_scraper.scraper import PlaywrightScraper
@@ -1415,7 +1457,8 @@ async def _schedule_loop(source: str, fn, interval_minutes: int, initial_delay_s
         try:
             count = await fn()
             SCHEDULER_STATUS[source]["last_imported"] = count
-            SCHEDULER_STATUS[source]["last_error"] = None
+            if source != "facebook" or SCHEDULER_STATUS[source].get("last_error") in (None, ""):
+                SCHEDULER_STATUS[source]["last_error"] = None
             logger.info("Scheduler [%s]: %d new imports", source, count)
             if count > 0:
                 await asyncio.to_thread(_rescore_sync)
@@ -1435,6 +1478,9 @@ async def _schedule_loop(source: str, fn, interval_minutes: int, initial_delay_s
 @app.get("/api/scraper/status")
 def get_scraper_status():
     """Return scheduler state per source plus last 10 log entries."""
+    SCHEDULER_STATUS["facebook"]["auth"] = _inspect_facebook_cookies()
+    if not SCHEDULER_STATUS["facebook"]["auth"]["valid"]:
+        SCHEDULER_STATUS["facebook"]["last_error"] = SCHEDULER_STATUS["facebook"]["auth"]["message"]
     return {
         "sources": SCHEDULER_STATUS,
         "log_path": str(SCRAPE_LOG_PATH),

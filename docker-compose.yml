@@ -13,6 +13,7 @@ services:
     environment:
       - MONGO_URL=mongodb://dealscope_mongo:27017
       - DB_NAME=dealscope
+      - FB_COOKIES_PATH=/app/cookies/fb_cookies.json
       - TELEGRAM_BOT_TOKEN=8675328720:AAF0zHpM7kHRkxi7QTR6bR3lGE3TPYmHvr8
       - TELEGRAM_CHAT_ID=8117077027
       - ALERT_SCORE_THRESHOLD=70
