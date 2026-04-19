@@ -75,37 +75,48 @@ SCHEDULER_STATUS: dict = {
 }
 
 
-def _inspect_facebook_cookies() -> dict:
+def _fb_operator_assist(status: str) -> Optional[str]:
+    if status in {"missing", "invalid", "expired"}:
+        return "Upload fresh Facebook cookies to restore ingestion"
+    return None
+
+
+def _validate_facebook_cookie_data(cookie_data) -> dict:
     state = {
         "path": str(FB_COOKIES_PATH),
-        "present": FB_COOKIES_PATH.exists(),
+        "present": bool(cookie_data),
         "valid": False,
         "expired": False,
         "cookie_count": 0,
         "missing_required": [],
         "message": None,
+        "status": "invalid",
+        "operator_message": _fb_operator_assist("invalid"),
     }
-    if not state["present"]:
-        state["message"] = "missing_cookies"
+
+    if not isinstance(cookie_data, list) or not cookie_data:
+        state["message"] = "invalid_cookies: empty list"
         return state
 
-    try:
-        cookie_data = json.loads(FB_COOKIES_PATH.read_text())
-        if not isinstance(cookie_data, list) or not cookie_data:
-            raise ValueError("empty list")
-    except Exception as exc:
-        state["message"] = f"invalid_cookies: {exc}"
+    invalid_items = [idx for idx, item in enumerate(cookie_data) if not isinstance(item, dict)]
+    if invalid_items:
+        state["message"] = f"invalid_cookies: cookie entries must be objects (bad indexes: {invalid_items[:5]})"
         return state
 
     state["cookie_count"] = len(cookie_data)
     now_ts = datetime.now(timezone.utc).timestamp()
-    names = {str(item.get("name", "")) for item in cookie_data if isinstance(item, dict)}
+    names = {str(item.get("name", "")) for item in cookie_data}
     required = [name for name in ("c_user", "xs") if name not in names]
-    expiries = [
-        float(item["expires"])
-        for item in cookie_data
-        if isinstance(item, dict) and item.get("expires") not in (None, -1, "")
-    ]
+    expiries = []
+    for item in cookie_data:
+        expires = item.get("expires")
+        if expires in (None, -1, ""):
+            continue
+        try:
+            expiries.append(float(expires))
+        except (TypeError, ValueError):
+            state["message"] = f"invalid_cookies: invalid expires value for {item.get('name', 'unknown')}"
+            return state
 
     state["missing_required"] = required
     if required:
@@ -114,12 +125,78 @@ def _inspect_facebook_cookies() -> dict:
 
     if expiries and max(expiries) < now_ts:
         state["expired"] = True
+        state["status"] = "expired"
         state["message"] = "expired_cookies"
+        state["operator_message"] = _fb_operator_assist("expired")
         return state
 
     state["valid"] = True
+    state["status"] = "valid"
     state["message"] = "ready"
+    state["operator_message"] = None
     return state
+
+
+def _inspect_facebook_cookies() -> dict:
+    if not FB_COOKIES_PATH.exists():
+        return {
+            "path": str(FB_COOKIES_PATH),
+            "present": False,
+            "valid": False,
+            "expired": False,
+            "cookie_count": 0,
+            "missing_required": [],
+            "message": "missing_cookies",
+            "status": "missing",
+            "operator_message": _fb_operator_assist("missing"),
+        }
+
+    try:
+        cookie_data = json.loads(FB_COOKIES_PATH.read_text())
+    except Exception as exc:
+        return {
+            "path": str(FB_COOKIES_PATH),
+            "present": True,
+            "valid": False,
+            "expired": False,
+            "cookie_count": 0,
+            "missing_required": [],
+            "message": f"invalid_cookies: {exc}",
+            "status": "invalid",
+            "operator_message": _fb_operator_assist("invalid"),
+        }
+
+    return _validate_facebook_cookie_data(cookie_data)
+
+
+async def _write_fb_cookies_upload(content: bytes) -> dict:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        return {
+            "saved": False,
+            "validation": {
+                "path": str(FB_COOKIES_PATH),
+                "present": False,
+                "valid": False,
+                "expired": False,
+                "cookie_count": 0,
+                "missing_required": [],
+                "message": f"invalid_cookies: {exc}",
+                "status": "invalid",
+                "operator_message": _fb_operator_assist("invalid"),
+            },
+        }
+
+    validation = _validate_facebook_cookie_data(payload)
+    if validation["status"] == "invalid":
+        return {"saved": False, "validation": validation}
+
+    FB_COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = FB_COOKIES_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2))
+    tmp_path.replace(FB_COOKIES_PATH)
+    return {"saved": True, "validation": _inspect_facebook_cookies()}
 
 
 # ---------------------------------------------------------------------------
@@ -839,10 +916,14 @@ class EbayScrapeRequest(BaseModel):
 
 @app.post("/api/scrape/ebay")
 def scrape_ebay_endpoint(req: EbayScrapeRequest):
-    from scrapers.ebay import scrape_ebay as do_scrape
+    from scrapers.ebay import scrape_ebay as do_scrape, _resolve_search_keyword
+
+    keyword = _resolve_search_keyword(req.query, req.category)
+    if not keyword:
+        raise HTTPException(status_code=400, detail="eBay keyword is required")
 
     result = do_scrape(
-        query=req.query,
+        query=keyword,
         category=req.category,
         listing_type=req.listing_type,
         min_price=req.min_price,
@@ -862,12 +943,12 @@ def scrape_ebay_endpoint(req: EbayScrapeRequest):
             skipped += 1
 
     import_runs_col.insert_one({
-        "source": "ebay", "query": req.query, "category": req.category,
+        "source": "ebay", "query": keyword, "category": req.category,
         "count": imported, "skipped": skipped,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return {"success": True, "imported": imported, "skipped": skipped,
-            "total_found": result["total_found"], "source_url": result["source_url"]}
+            "total_found": result["total_found"], "source_url": result["source_url"], "query": keyword}
 
 
 # ---------------------------------------------------------------------------
@@ -1469,6 +1550,22 @@ async def _schedule_loop(source: str, fn, interval_minutes: int, initial_delay_s
             SCHEDULER_STATUS[source]["running"] = False
         elapsed = datetime.now(timezone.utc).timestamp() - now.timestamp()
         await asyncio.sleep(max(10, interval_minutes * 60 - elapsed))
+
+
+@app.post("/api/system/upload-fb-cookies")
+async def upload_facebook_cookies(file: UploadFile = File(...)):
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="File must be .json")
+
+    content = await file.read()
+    result = await _write_fb_cookies_upload(content)
+    validation = result["validation"]
+    return {
+        "success": result["saved"],
+        "path": validation["path"],
+        "validation": validation,
+    }
 
 
 # ---------------------------------------------------------------------------

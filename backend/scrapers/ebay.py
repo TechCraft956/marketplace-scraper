@@ -41,6 +41,24 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
+KEYWORD_FALLBACKS = {
+    "tools": "tools",
+    "power-tools": "power tools",
+    "motorcycles": "motorcycles",
+    "heavy-equipment": "heavy equipment",
+    "electronics": "electronics",
+    "trucks": "trucks",
+    "trailers": "trailers",
+}
+
+
+def _resolve_search_keyword(query: str, category: str) -> str:
+    keyword = (query or "").strip()
+    if keyword:
+        return keyword
+    category_key = (category or "").strip().lower()
+    return KEYWORD_FALLBACKS.get(category_key, category_key.replace("-", " ").strip())
+
 
 def _session() -> requests.Session:
     s = requests.Session()
@@ -84,6 +102,8 @@ def _scrape_html(
     max_results: int,
 ) -> list[dict]:
     """HTML scrape of eBay search results page."""
+    if not query:
+        raise ValueError("eBay keyword is required")
     cat_id = EBAY_CATEGORIES.get(category.lower(), "")
     params: dict = {"_nkw": query, "_ipg": min(max_results, 60)}
     if cat_id:
@@ -172,6 +192,8 @@ def _scrape_finding_api(
     max_results: int,
 ) -> list[dict]:
     """eBay Finding API (requires EBAY_APP_ID)."""
+    if not query:
+        raise ValueError("eBay keyword is required")
     cat_id = EBAY_CATEGORIES.get(category.lower(), "")
     op = "findItemsByKeywords" if not cat_id else "findItemsAdvanced"
 
@@ -260,15 +282,24 @@ def scrape_ebay(
     Returns:
         {"listings": [...], "total_found": int, "source_url": str, "error": str|None}
     """
-    source_url = f"https://www.ebay.com/sch/i.html?_nkw={quote_plus(query or category)}"
+    search_keyword = _resolve_search_keyword(query, category)
+    if not search_keyword:
+        return {
+            "listings": [],
+            "total_found": 0,
+            "source_url": "https://www.ebay.com",
+            "error": "eBay keyword is required",
+        }
+
+    source_url = f"https://www.ebay.com/sch/i.html?_nkw={quote_plus(search_keyword)}"
 
     try:
         if EBAY_APP_ID:
             logger.info("eBay: using Finding API (app_id configured)")
-            listings = _scrape_finding_api(query, category, listing_type, min_price, max_price, max_results)
+            listings = _scrape_finding_api(search_keyword, category, listing_type, min_price, max_price, max_results)
         else:
             logger.info("eBay: using HTML scraping (no EBAY_APP_ID set)")
-            listings = _scrape_html(query, category, listing_type, min_price, max_price, max_results)
+            listings = _scrape_html(search_keyword, category, listing_type, min_price, max_price, max_results)
             time.sleep(random.uniform(1.0, 2.0))
 
         return {
