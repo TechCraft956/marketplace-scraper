@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import notifier
+import action_engine
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -931,14 +932,13 @@ def get_opportunities(
 
 
 def _rescore_sync() -> dict:
-    """Rescore all active listings, promote geo fields to top level, upsert opportunities, fire alerts."""
+    """Rescore all active listings, refresh opportunities, and emit only Top 3 action briefings by default."""
     cursor = listings_col.find({"is_sold": {"$ne": True}})
     upserted = alerted = rescored = 0
     for doc in cursor:
         listing_id = str(doc["_id"])
         clean = {k: v for k, v in doc.items() if k != "_id"}
 
-        # Rescore to pick up new geo/practicality fields
         try:
             breakdown = score_listing(clean)
             update_fields = {
@@ -951,6 +951,8 @@ def _rescore_sync() -> dict:
                 "score_breakdown": breakdown,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
+            action_fields = action_engine.compute_action_score({**clean, **update_fields})
+            update_fields.update(action_fields)
             listings_col.update_one({"_id": doc["_id"]}, {"$set": update_fields})
             clean.update(update_fields)
             rescored += 1
@@ -960,15 +962,27 @@ def _rescore_sync() -> dict:
         if notifier.is_opportunity(clean):
             _upsert_opportunity(clean, listing_id)
             upserted += 1
-            if notifier.maybe_alert(clean, listing_id):
+            if notifier.maybe_alert(clean, listing_id, clean.get("action_score") or 0.0):
                 alerted += 1
 
-    top = list(
+    top_docs = list(
         scored_opportunities_col.find({"score": {"$gte": 70}})
         .sort("score", DESCENDING).limit(200)
     )
-    _write_scored_json([{k: v for k, v in d.items() if k != "_id"} for d in top])
-    return {"rescored": rescored, "upserted": upserted, "alerted": alerted}
+    top_actions, suppressed_count = action_engine.rank_top_actions([
+        _serialize_opportunity(doc) for doc in top_docs
+    ], top_n=3)
+    if notifier.maybe_alert_top3(top_actions, suppressed_count):
+        alerted += 1
+
+    _write_scored_json([{k: v for k, v in d.items() if k != "_id"} for d in top_docs])
+    return {
+        "rescored": rescored,
+        "upserted": upserted,
+        "alerted": alerted,
+        "top_actions_count": len(top_actions),
+        "suppressed_count": suppressed_count,
+    }
 
 
 @app.post("/api/opportunities/rescore")
@@ -1008,8 +1022,9 @@ def _serialize_opportunity(doc: dict) -> dict:
     """Serialize a listing doc for opportunity endpoints."""
     doc = dict(doc)
     doc["id"] = str(doc.pop("_id", ""))
-    return {
+    payload = {
         "id": doc.get("id"),
+        "listing_id": doc.get("listing_id") or doc.get("id"),
         "source": doc.get("source"),
         "title": doc.get("title"),
         "price": doc.get("price"),
@@ -1024,6 +1039,21 @@ def _serialize_opportunity(doc: dict) -> dict:
         "location": doc.get("location"),
         "alert_reason": notifier.alert_reason(doc),
     }
+
+    for key in (
+        "action_score",
+        "time_to_cash_days",
+        "profit_per_day",
+        "friction_score",
+        "friction_reasons",
+        "reason_to_act",
+        "rank",
+        "why_ranked_here",
+    ):
+        if key in doc:
+            payload[key] = doc.get(key)
+
+    return payload
 
 
 @app.get("/opportunities/local-best")
@@ -1057,6 +1087,28 @@ def get_high_value():
             candidates.append(_serialize_opportunity(doc))
     candidates.sort(key=lambda x: x.get("estimated_profit_low") or 0, reverse=True)
     return {"opportunities": candidates[:20], "count": min(len(candidates), 20)}
+
+
+@app.get("/api/opportunities/top-actions")
+def get_top_actions(
+    limit: int = Query(3, ge=1, le=10),
+    min_score: float = Query(70, ge=0, le=100),
+):
+    """Return the best 1..N moves worth acting on today, ranked by action_score."""
+    docs = list(
+        scored_opportunities_col.find({"score": {"$gte": min_score}})
+        .sort("score", DESCENDING).limit(200)
+    )
+    ranked, suppressed_count = action_engine.rank_top_actions(
+        [_serialize_opportunity(doc) for doc in docs],
+        top_n=limit,
+    )
+    return {
+        "top_actions": ranked,
+        "count": len(ranked),
+        "suppressed_count": suppressed_count,
+        "min_score": min_score,
+    }
 
 
 # ---------------------------------------------------------------------------
