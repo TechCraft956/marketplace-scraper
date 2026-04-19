@@ -24,7 +24,7 @@ services:
       - FAR_OVERRIDE_PROFIT=2500
       - FAR_OVERRIDE_CATEGORIES=heavy_equipment,equipment,vehicles,motorcycles,cars+trucks
       - LOCAL_FLIPS_MODE=true
-      - CRAIGSLIST_LOCATION=sfbay,mcallen,laredo,corpuschristi,harlingen
+      - CRAIGSLIST_LOCATION=mcallen,laredo,corpuschristi,harlingen,brownsville,sfbay
     volumes:
       # Cookies for Playwright auth — place fb_cookies.json here before scraping
       - ./data/cookies:/app/cookies
