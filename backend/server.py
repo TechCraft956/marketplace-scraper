@@ -1026,6 +1026,7 @@ def _serialize_opportunity(doc: dict) -> dict:
         "id": doc.get("id"),
         "listing_id": doc.get("listing_id") or doc.get("id"),
         "source": doc.get("source"),
+        "is_example": doc.get("source") == "seed_data",
         "title": doc.get("title"),
         "price": doc.get("price"),
         "score": doc.get("score"),
@@ -1091,13 +1092,18 @@ def get_high_value():
 
 @app.get("/api/opportunities/top-actions")
 def get_top_actions(
-    limit: int = Query(3, ge=1, le=10),
+    limit: int = Query(3, ge=1, le=25),
     min_score: float = Query(70, ge=0, le=100),
+    include_examples: bool = Query(False),
 ):
     """Return the best 1..N moves worth acting on today, ranked by action_score."""
+    query: dict = {"score": {"$gte": min_score}}
+    if not include_examples:
+        query["source"] = {"$ne": "seed_data"}
+
     docs = list(
-        scored_opportunities_col.find({"score": {"$gte": min_score}})
-        .sort("score", DESCENDING).limit(200)
+        scored_opportunities_col.find(query)
+        .sort("score", DESCENDING).limit(300)
     )
     ranked, suppressed_count = action_engine.rank_top_actions(
         [_serialize_opportunity(doc) for doc in docs],
@@ -1108,6 +1114,37 @@ def get_top_actions(
         "count": len(ranked),
         "suppressed_count": suppressed_count,
         "min_score": min_score,
+        "include_examples": include_examples,
+    }
+
+
+@app.get("/api/opportunities/more")
+def get_more_opportunities(
+    limit: int = Query(20, ge=1, le=100),
+    min_score: float = Query(70, ge=0, le=100),
+    include_examples: bool = Query(False),
+    sort_by: str = Query("action_score", pattern="^(action_score|score|estimated_profit_low)$"),
+):
+    """Return a broader ranked set beyond the default brief for dashboard/chat expansion."""
+    query: dict = {"score": {"$gte": min_score}}
+    if not include_examples:
+        query["source"] = {"$ne": "seed_data"}
+
+    docs = [_serialize_opportunity(doc) for doc in scored_opportunities_col.find(query).sort("score", DESCENDING).limit(400)]
+    ranked, _ = action_engine.rank_top_actions(docs, top_n=len(docs))
+
+    if sort_by == "score":
+        ranked.sort(key=lambda x: x.get("score") or 0, reverse=True)
+    elif sort_by == "estimated_profit_low":
+        ranked.sort(key=lambda x: x.get("estimated_profit_low") or 0, reverse=True)
+
+    return {
+        "opportunities": ranked[:limit],
+        "count": min(len(ranked), limit),
+        "total_ranked": len(ranked),
+        "min_score": min_score,
+        "include_examples": include_examples,
+        "sort_by": sort_by,
     }
 
 

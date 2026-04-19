@@ -27,8 +27,9 @@ TOP3_STATE_FILE: Path = STORAGE_PATH / "top3_alerted_ids.json"
 
 # Per-listing maybe_alert only fires at this action_score threshold (truly exceptional)
 EXCEPTIONAL_ACTION_SCORE: float = 90.0
-# Minimum seconds between top3 briefings
+# Minimum seconds between top-action briefings
 TOP3_COOLDOWN_SECS: int = 3600
+TOP_ACTIONS_BRIEF_LIMIT: int = int(os.environ.get("TOP_ACTIONS_BRIEF_LIMIT", "5"))
 
 
 def _get(listing: dict, field: str, default=None):
@@ -253,18 +254,21 @@ def format_top3_briefing(top_actions: list[dict], suppressed_count: int) -> str:
         rank = item.get("rank", 0)
         lines.append(_format_top3_move(rank, item))
         lines.append("")
-    lines.append(f"⚡ {suppressed_count} other deals tracked. Only the best made it.")
+    if suppressed_count > 0:
+        lines.append(f"⚡ {suppressed_count} other deals tracked. Ask for more to expand the list.")
     return "\n".join(lines)
 
 
 def maybe_alert_top3(top_actions: list[dict], suppressed_count: int = 0) -> bool:
-    """Fire ONE combined Telegram briefing when the top 3 refreshes with new listings.
+    """Fire ONE combined Telegram briefing when the top action set refreshes with new listings.
 
     Deduplicates by listing_id. Rate-limited to once per hour.
     Returns True if message was sent.
     """
     if not top_actions:
         return False
+
+    top_actions = top_actions[:TOP_ACTIONS_BRIEF_LIMIT]
 
     state = _load_top3_state()
     alerted_ids: set[str] = set(state.get("alerted_ids", []))
