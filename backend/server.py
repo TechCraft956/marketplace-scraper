@@ -334,7 +334,7 @@ TOP_TIER_LOCAL_DISTANCE = 50.0
 STRETCH_LOCAL_DISTANCE = 100.0
 VERY_HIGH_SCORE_THRESHOLD = 110.0
 HIGH_DEPRIORITIZED_SCORE = 120.0
-TOP_DEALS_LIMIT = 5
+TOP_DEALS_LIMIT = 3
 
 
 def _normalize_source(value: Optional[str]) -> str:
@@ -378,12 +378,26 @@ def _quality_allowed(listing: dict) -> bool:
 
     price = listing.get("price")
     if price is None:
+        price_raw = title
+        m = re.search(r"\$(\d[\d,]*(?:\.\d+)?)", price_raw)
+        if m:
+            try:
+                price = float(m.group(1).replace(',', ''))
+                listing["price"] = price
+            except ValueError:
+                price = None
+    if price is None:
         return False
     try:
         if float(price) <= 0:
             return False
     except (TypeError, ValueError):
         return False
+
+    if not (listing.get("location") or ""):
+        tail = re.sub(r".*\$(?:\d[\d,]*(?:\.\d+)?)", "", title).strip()
+        if tail:
+            listing["location"] = tail
 
     combined = f"{title} {(listing.get('description') or '')}".lower()
     spam_markers = (
@@ -426,6 +440,58 @@ def _estimated_value(listing: dict) -> Optional[float]:
     return None
 
 
+def _signal_label(listing: dict) -> str:
+    distance = _normalized_distance(listing)
+    score = float(listing.get("score") or 0)
+    if _local_opportunity_allowed(listing):
+        return "local_actionable"
+    if distance is not None and distance <= TOP_TIER_LOCAL_DISTANCE:
+        return "local_watch"
+    if distance is not None and distance <= STRETCH_LOCAL_DISTANCE:
+        return "stretch_candidate"
+    if score >= 55:
+        return "weak_signal"
+    return "weak_signal"
+
+
+def _candidate_rank_tuple(listing: dict):
+    label = _signal_label(listing)
+    rank = {"local_actionable": 0, "local_watch": 1, "stretch_candidate": 2, "weak_signal": 3}.get(label, 4)
+    distance = _normalized_distance(listing)
+    distance_sort = distance if distance is not None else 99999
+    action_score = float(listing.get("action_score") or 0)
+    score = float(listing.get("score") or 0)
+    profit = float(listing.get("effective_profit_after_travel") or listing.get("estimated_profit_low") or 0)
+    return (rank, -action_score, -score, distance_sort, -profit)
+
+
+def _select_marketplace_candidates(top_actions: list[dict], fallback_docs: list[dict]) -> tuple[list[dict], bool]:
+    actionable = [item for item in top_actions if _local_opportunity_allowed(item)]
+    if actionable:
+        selected = actionable[:TOP_DEALS_LIMIT]
+        for item in selected:
+            item["signal_label"] = _signal_label(item)
+        return selected, False
+
+    fallback = []
+    for item in top_actions + fallback_docs:
+        if not _source_allowed(item):
+            continue
+        if not _quality_allowed(item):
+            continue
+        enriched = dict(item)
+        enriched["signal_label"] = _signal_label(enriched)
+        fallback.append(enriched)
+
+    dedup = {}
+    for item in fallback:
+        key = item.get("listing_url") or item.get("title") or str(id(item))
+        if key not in dedup:
+            dedup[key] = item
+    ranked = sorted(dedup.values(), key=_candidate_rank_tuple)
+    return ranked[:TOP_DEALS_LIMIT], True
+
+
 def score_listing(listing: dict) -> dict:
     scorer = ResaleScorer(max_acceptable_distance=STRETCH_LOCAL_DISTANCE)
     result = scorer.score(listing)
@@ -454,8 +520,12 @@ def _write_scored_json(results: list) -> None:
 
 
 
+def _runtime_base_dir() -> Path:
+    return Path(os.environ.get("PINEAPPLE_CONTROL_PLANE_DIR", "/Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime"))
+
+
 def _agency_output_path() -> Path:
-    return Path(os.environ.get("PINEAPPLE_CONTROL_PLANE_DIR", "/Users/DdyFngr/.openclaw/workspace/control-plane")) / "agencies" / "marketplace-opportunity" / "latest-output.json"
+    return _runtime_base_dir() / "agencies" / "marketplace-opportunity" / "latest-output.json"
 
 
 def _write_marketplace_agency_output(top_actions: list[dict], run_summary: dict) -> None:
@@ -479,10 +549,13 @@ def _write_marketplace_agency_output(top_actions: list[dict], run_summary: dict)
                 "reason_to_act": item.get("reason_to_act"),
                 "source": item.get("source"),
                 "listing_url": item.get("listing_url"),
+                "signal_label": item.get("signal_label"),
             }
             for item in top_actions[:TOP_DEALS_LIMIT]
         ],
         "source_breakdown": run_summary.get("source_breakdown", []),
+        "operator_note": run_summary.get("operator_note"),
+        "blockers": run_summary.get("blockers", []),
     }
     path = _agency_output_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -490,7 +563,10 @@ def _write_marketplace_agency_output(top_actions: list[dict], run_summary: dict)
 
 
 def _refresh_executive_outputs() -> dict:
-    base = Path(os.environ.get("PINEAPPLE_CONTROL_PLANE_DIR", "/Users/DdyFngr/.openclaw/workspace/control-plane"))
+    base = _runtime_base_dir()
+    (base / "state").mkdir(parents=True, exist_ok=True)
+    (base / "logs").mkdir(parents=True, exist_ok=True)
+    (base / "agencies" / "marketplace-opportunity").mkdir(parents=True, exist_ok=True)
     tasks_path = base / "state" / "tasks.jsonl"
     audit_path = base / "logs" / "audit.jsonl"
     decision_path = base / "state" / "decision-inbox.json"
@@ -530,16 +606,51 @@ def _refresh_executive_outputs() -> dict:
         }
         for t in active if t.get("decision_required")
     ]
+    if audit_path.exists():
+        for line in audit_path.read_text().splitlines()[-25:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            if event.get("event_type") == "decision_requested" and event.get("decision_required"):
+                decisions.append({
+                    "decision_id": f"dec-{event.get('task_id')}",
+                    "task_id": event.get("task_id"),
+                    "agency": event.get("agency"),
+                    "title": event.get("summary"),
+                    "options": ["keep current policy", "loosen gating", "inspect source health"],
+                    "recommended_option": "inspect source health",
+                    "consequence_if_no_action": "Operator outputs may stay weak or sparse",
+                    "deadline": None,
+                    "supporting_facts": event.get("rationale"),
+                })
     decision_path.write_text(json.dumps(decisions, indent=2))
 
     wins = [t for t in latest_by_task.values() if t.get("state") == "completed"][-5:]
-    risks = [t for t in active if t.get("priority_band") in {"p0", "p1"}]
-    lines = ["# Daily Brief", "", "## Wins"]
+    lines = ["# Daily Brief", "", "## What Ran"]
     lines += [f"- {t.get('title')} ({t.get('owner_agency')})" for t in wins] or ["- None"]
-    lines += ["", "## Risks"]
-    lines += [f"- {t.get('title')} [{t.get('state')}]" for t in risks] or ["- None"]
-    lines += ["", "## Next Recommended Actions"]
-    lines += [f"- {t.get('title')}" for t in active[:5]] or ["- None"]
+    lines += ["", "## What Was Found"]
+    latest_run = latest_by_task.get("marketplace-live-run", {})
+    result = latest_run.get("result") or {}
+    if result:
+        lines.append(f"- craigslist_imported={result.get('craigslist_imported', 0)}, ebay_imported={result.get('ebay_imported', 0)}, rescored={result.get('rescored', 0)}, top_actions={result.get('top_actions_count', 0)}")
+        for blocker in result.get("blockers", [])[:3]:
+            lines.append(f"- blocker: {blocker}")
+    else:
+        lines.append("- None")
+    lines += ["", "## What Matters Now"]
+    if decisions:
+        lines += [f"- {d.get('title')}" for d in decisions[:3]]
+    else:
+        lines.append("- No material decisions pending")
+    lines += ["", "## What To Do Next"]
+    if decisions:
+        lines.append(f"- {decisions[0].get('recommended_option')}")
+    else:
+        lines.append("- Continue next scheduled marketplace run")
     brief_path.write_text("\n".join(lines) + "\n")
 
     exception_events = []
@@ -598,10 +709,24 @@ def _force_marketplace_agency_run() -> dict:
 
     rescore = _rescore_sync()
     top_actions = TOP_ACTIONS_CACHE.get("top_actions") or []
+    fallback_docs = []
+    cursor = listings_col.find().sort("score", DESCENDING).limit(300)
+    for doc in cursor:
+        fallback_docs.append(_serialize_opportunity(doc))
+    selected_actions, used_fallback = _select_marketplace_candidates(top_actions, fallback_docs)
+
     source_counts = {}
-    for item in top_actions:
+    for item in selected_actions:
         source = item.get("source") or "unknown"
         source_counts[source] = source_counts.get(source, 0) + 1
+
+    blockers = []
+    operator_note = "Returned best available top 3 candidates under local-first policy."
+    if ebay_imported == 0:
+        blockers.append("eBay HTML scraper is being challenged by anti-bot interruption page")
+    if used_fallback:
+        blockers.append("No true local_actionable winners this run, fallback candidates returned")
+        operator_note = "No strict local winners found, returned nearest viable watch/stretch candidates instead."
 
     run_summary = {
         "craigslist_imported": craigslist_imported,
@@ -609,21 +734,26 @@ def _force_marketplace_agency_run() -> dict:
         "craigslist_error": craigslist_error,
         "ebay_error": ebay_error,
         "rescored": rescore.get("rescored", 0),
-        "top_actions_count": len(top_actions),
+        "top_actions_count": len(selected_actions),
         "source_breakdown": [{"source": k, "count": v} for k, v in sorted(source_counts.items())],
+        "operator_note": operator_note,
+        "blockers": blockers,
+        "used_fallback": used_fallback,
     }
-    _write_marketplace_agency_output(top_actions, run_summary)
+    _write_marketplace_agency_output(selected_actions, run_summary)
     append_task_state_change(task["task_id"], "completed", "opportunity", "APEX", "Marketplace agency live run completed", result=run_summary)
     append_audit_event("execution_finished", "opportunity", "APEX", "Marketplace agency live run completed", task_id=task["task_id"], rationale="Outputs written to agency path", outputs_ref=[str(_agency_output_path())], run_summary=run_summary)
 
-    if not top_actions:
-        append_audit_event("decision_requested", "chief_of_staff", "APEX", "No actionable local marketplace deals found", task_id=task["task_id"], rationale="Need source/policy decision", decision_required=True)
+    if used_fallback:
+        append_audit_event("decision_requested", "chief_of_staff", "APEX", "No local_actionable marketplace winners, fallback candidates emitted", task_id=task["task_id"], rationale="Local-first policy preserved but dead run avoided", decision_required=False)
+    if ebay_imported == 0:
+        append_audit_event("failure_logged", "opportunity", "APEX", "eBay importer returned zero, anti-bot interruption suspected", task_id=task["task_id"], rationale="Needs API key or scraper refresh")
 
     executive = _refresh_executive_outputs()
     return {
         "task_id": task["task_id"],
         "run_summary": run_summary,
-        "top_actions": top_actions[:TOP_DEALS_LIMIT],
+        "top_actions": selected_actions[:TOP_DEALS_LIMIT],
         "executive": executive,
     }
 # ---------------------------------------------------------------------------
@@ -1345,7 +1475,7 @@ def get_opportunities(
 
 def _rescore_sync() -> dict:
     """Rescore all active listings, refresh opportunities, and emit only Top 3 action briefings by default."""
-    cursor = listings_col.find({"is_sold": {"$ne": True}})
+    cursor = listings_col.find()
     upserted = alerted = rescored = 0
     for doc in cursor:
         listing_id = str(doc["_id"])
@@ -1527,7 +1657,7 @@ def get_top_actions_brief(
 def get_local_best():
     """Top local/stretch opportunities sorted by score — the flip-ready shortlist."""
     results = []
-    cursor = listings_col.find({"is_sold": {"$ne": True}}).sort("score", DESCENDING).limit(500)
+    cursor = listings_col.find().sort("score", DESCENDING).limit(500)
     for doc in cursor:
         tier = _get_field(doc, "travel_tier", "unknown")
         profit_low = _get_field(doc, "estimated_profit_low") or 0
@@ -1546,7 +1676,7 @@ def get_local_best():
 def get_high_value():
     """Top listings by estimated profit where score >= 85 and confidence >= 0.7."""
     candidates = []
-    cursor = listings_col.find({"is_sold": {"$ne": True}}).sort("score", DESCENDING).limit(500)
+    cursor = listings_col.find().sort("score", DESCENDING).limit(500)
     for doc in cursor:
         score = doc.get("score") or 0
         confidence = _get_field(doc, "confidence") or 0
@@ -1895,7 +2025,7 @@ async def startup_event():
     if scored_opportunities_col.count_documents({}) == 0:
         logger.info("Populating scored_opportunities from existing listings...")
         count = 0
-        for doc in listings_col.find({"is_sold": {"$ne": True}}):
+        for doc in listings_col.find():
             listing_id = str(doc["_id"])
             clean = {k: v for k, v in doc.items() if k != "_id"}
             if notifier.is_opportunity(clean):

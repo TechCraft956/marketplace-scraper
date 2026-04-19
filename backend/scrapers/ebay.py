@@ -130,6 +130,11 @@ def _scrape_html(
         logger.error("eBay HTTP error: %s", e)
         return []
 
+    interruption_markers = ["Pardon Our Interruption", "splashui", "robot check", "verify yourself"]
+    if any(marker.lower() in resp.text.lower() for marker in interruption_markers):
+        logger.warning("eBay anti-bot interruption detected for %s", url)
+        return []
+
     soup = BeautifulSoup(resp.text, "html.parser")
     listings = []
 

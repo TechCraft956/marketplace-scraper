@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-BASE_DIR = Path(os.environ.get("PINEAPPLE_CONTROL_PLANE_DIR", "/Users/DdyFngr/.openclaw/workspace/control-plane"))
+BASE_DIR = Path(os.environ.get("PINEAPPLE_CONTROL_PLANE_DIR", "/Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime"))
 STATE_DIR = BASE_DIR / "state"
 LOG_DIR = BASE_DIR / "logs"
 TASKS_PATH = STATE_DIR / "tasks.jsonl"
@@ -17,6 +17,7 @@ def _now() -> str:
 
 
 def _ensure() -> None:
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
     TASKS_PATH.parent.mkdir(parents=True, exist_ok=True)
     AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
