@@ -8,6 +8,7 @@ import csv
 import json
 import io
 import re
+import zipfile
 import hashlib
 import logging
 from datetime import datetime, timezone
@@ -16,10 +17,11 @@ from typing import Optional
 
 import notifier
 import action_engine
-from task_audit import append_task_record, append_task_state_change, append_audit_event
+from task_audit import append_task_record, append_task_state_change, append_audit_event, STATE_DIR
 from events import emit, get_recent, register_sse_queue, unregister_sse_queue
 from operator_console import build_console_data
 from contact_drafter import save_draft, get_drafts, mark_draft, DRAFT_SCORE_THRESHOLD
+import approvals as approval_manager
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -65,6 +67,15 @@ scored_opportunities_col.create_index([("score", DESCENDING)])
 scored_opportunities_col.create_index("listing_id", unique=True, sparse=True)
 
 SCORED_JSON_PATH = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "scored.json"
+CANONICAL_RUNTIME_ROOT = Path(
+    os.environ.get(
+        "PINEAPPLE_CONTROL_PLANE_DIR",
+        "/Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime",
+    )
+)
+CANONICAL_STATE_DIR = CANONICAL_RUNTIME_ROOT / "state"
+INGESTION_ROOT = CANONICAL_RUNTIME_ROOT / "ingestion"
+LEGACY_PINEAPPLE_STATE_PATH = Path(os.environ.get("PINEAPPLE_STATE_PATH", "/app/pineapple-state"))
 
 TOP_ACTIONS_CACHE: dict = {"top_actions": [], "suppressed_count": 0, "cached_at": None}
 SCRAPE_LOG_PATH  = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "scrape_log.json"
@@ -329,12 +340,13 @@ def generate_hash(title: str, price, source: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-LOCAL_ONLY_SOURCES = {"craigslist", "craigslist_rss", "ebay"}
+LOCAL_ONLY_SOURCES = {"craigslist", "craigslist_rss", "ebay", "govdeals"}
 DEPRIORITIZED_SOURCES = {"publicsurplus", "govplanet"}
 TOP_TIER_LOCAL_DISTANCE = 50.0
 STRETCH_LOCAL_DISTANCE = 100.0
 VERY_HIGH_SCORE_THRESHOLD = 110.0
 HIGH_DEPRIORITIZED_SCORE = 120.0
+STALE_AUCTION_TIME_TO_CASH_DAYS = 10.0
 TOP_DEALS_LIMIT = 3
 
 
@@ -360,8 +372,17 @@ def _source_allowed(listing: dict) -> bool:
         return True
     score = float(listing.get("score") or 0)
     distance = _normalized_distance(listing)
+    time_to_cash_days = float(listing.get("time_to_cash_days") or 999)
+    action_score = float(listing.get("action_score") or 0)
     if source == "publicsurplus":
-        return score >= HIGH_DEPRIORITIZED_SCORE and distance is not None and distance <= STRETCH_LOCAL_DISTANCE
+        return (
+            distance is not None
+            and distance <= STRETCH_LOCAL_DISTANCE
+            and (
+                score >= HIGH_DEPRIORITIZED_SCORE
+                or (action_score >= 55 and time_to_cash_days <= STALE_AUCTION_TIME_TO_CASH_DAYS)
+            )
+        )
     if source == "govplanet":
         return distance is not None and distance <= STRETCH_LOCAL_DISTANCE and score >= VERY_HIGH_SCORE_THRESHOLD
     return False
@@ -458,12 +479,14 @@ def _signal_label(listing: dict) -> str:
 def _candidate_rank_tuple(listing: dict):
     label = _signal_label(listing)
     rank = {"local_actionable": 0, "local_watch": 1, "stretch_candidate": 2, "weak_signal": 3}.get(label, 4)
+    source = _normalize_source(listing.get("source"))
+    source_penalty = 1 if source in DEPRIORITIZED_SOURCES else 0
     distance = _normalized_distance(listing)
     distance_sort = distance if distance is not None else 99999
     action_score = float(listing.get("action_score") or 0)
     score = float(listing.get("score") or 0)
     profit = float(listing.get("effective_profit_after_travel") or listing.get("estimated_profit_low") or 0)
-    return (rank, -action_score, -score, distance_sort, -profit)
+    return (rank, source_penalty, -action_score, -score, distance_sort, -profit)
 
 
 def _select_marketplace_candidates(top_actions: list[dict], fallback_docs: list[dict]) -> tuple[list[dict], bool]:
@@ -994,6 +1017,82 @@ def parse_price_str(s: str) -> Optional[float]:
     return None
 
 
+def _ingestion_dirs() -> dict[str, Path]:
+    raw_dir = INGESTION_ROOT / "raw"
+    extracted_dir = INGESTION_ROOT / "extracted"
+    index_dir = INGESTION_ROOT / "index"
+    for path in (raw_dir, extracted_dir, index_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    return {"raw": raw_dir, "extracted": extracted_dir, "index": index_dir}
+
+
+def _ingestion_slug(name: str) -> str:
+    base = re.sub(r"[^a-zA-Z0-9._-]+", "-", (name or "upload").strip()).strip("-._")
+    return base or "upload"
+
+
+def _classify_ingestion_content(text: str, filename: str, mime_type: str) -> dict:
+    body = (text or "").lower()
+    name = (filename or "").lower()
+    kind = "unknown"
+    tags = []
+
+    rules = [
+        ("marketplace", ["listing", "resale", "auction", "pickup", "bid", "marketplace"]),
+        ("finance", ["invoice", "revenue", "expense", "profit", "bank", "credit"]),
+        ("school", ["assignment", "syllabus", "class", "semester", "grade"]),
+        ("ops", ["task", "runbook", "server", "incident", "deployment", "monitor"]),
+        ("legal", ["agreement", "contract", "terms", "liability", "signature"]),
+        ("personal", ["journal", "note", "todo", "reminder"]),
+    ]
+    for label, markers in rules:
+        if any(marker in body or marker in name for marker in markers):
+            kind = label
+            tags.append(label)
+            break
+
+    if filename.lower().endswith(".csv"):
+        tags.append("tabular")
+    if mime_type.startswith("text/"):
+        tags.append("text")
+    elif "zip" in mime_type or filename.lower().endswith(".zip"):
+        tags.append("archive")
+
+    return {"kind": kind, "tags": sorted(set(tags))}
+
+
+def _write_ingestion_record(record: dict) -> None:
+    dirs = _ingestion_dirs()
+    index_path = dirs["index"] / "records.jsonl"
+    with index_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _ingest_text_blob(filename: str, text: str, mime_type: str, source_label: str) -> dict:
+    dirs = _ingestion_dirs()
+    slug = _ingestion_slug(filename)
+    digest = hashlib.sha1(f"{filename}:{text[:500]}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+    stored_name = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{digest}-{slug}"
+    extracted_path = dirs["extracted"] / f"{stored_name}.txt"
+    extracted_path.write_text(text, encoding="utf-8")
+
+    classification = _classify_ingestion_content(text, filename, mime_type)
+    preview = re.sub(r"\s+", " ", text).strip()[:280]
+    record = {
+        "id": stored_name,
+        "source": source_label,
+        "filename": filename,
+        "mime_type": mime_type,
+        "stored_text_path": str(extracted_path),
+        "classification": classification,
+        "preview": preview,
+        "size_bytes": len(text.encode("utf-8")),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_ingestion_record(record)
+    return record
+
+
 @app.post("/api/import/json")
 async def import_json(file: UploadFile = File(...)):
     if not file.filename.endswith(".json"):
@@ -1071,6 +1170,73 @@ async def import_manual(listing: dict):
     if not result:
         raise HTTPException(status_code=400, detail="Could not import listing (missing title or duplicate)")
     return {"success": True, "listing_id": result}
+
+
+@app.post("/api/ingest/file")
+async def ingest_file(file: UploadFile = File(...)):
+    filename = file.filename or "upload"
+    content = await file.read()
+    mime_type = file.content_type or "application/octet-stream"
+    dirs = _ingestion_dirs()
+    slug = _ingestion_slug(filename)
+    raw_path = dirs["raw"] / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{slug}"
+    raw_path.write_bytes(content)
+
+    records = []
+    if filename.lower().endswith(".zip") or mime_type in {"application/zip", "application/x-zip-compressed"}:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                member_bytes = zf.read(member)
+                member_name = member.filename
+                if member_name.lower().endswith(".csv"):
+                    try:
+                        text = member_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        text = member_bytes.decode("latin-1", errors="ignore")
+                    reader = csv.DictReader(io.StringIO(text))
+                    rows = list(reader)
+                    normalized = json.dumps(rows[:200], ensure_ascii=False, indent=2)
+                    records.append(_ingest_text_blob(member_name, normalized, "text/csv", "zip_csv"))
+                else:
+                    try:
+                        text = member_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        text = member_bytes.decode("latin-1", errors="ignore")
+                    records.append(_ingest_text_blob(member_name, text, "text/plain", "zip_text"))
+    elif filename.lower().endswith(".csv"):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            text = content.decode("latin-1", errors="ignore")
+        reader = csv.DictReader(io.StringIO(text))
+        rows = list(reader)
+        normalized = json.dumps(rows[:500], ensure_ascii=False, indent=2)
+        records.append(_ingest_text_blob(filename, normalized, mime_type or "text/csv", "csv_upload"))
+    else:
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            text = content.decode("latin-1", errors="ignore")
+        records.append(_ingest_text_blob(filename, text, mime_type, "file_upload"))
+
+    return {
+        "success": True,
+        "raw_path": str(raw_path),
+        "records": records,
+        "count": len(records),
+    }
+
+
+@app.get("/api/ingest/records")
+def list_ingestion_records(limit: int = Query(50, ge=1, le=500)):
+    index_path = _ingestion_dirs()["index"] / "records.jsonl"
+    if not index_path.exists():
+        return {"records": [], "count": 0}
+    lines = index_path.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines[-limit:] if line.strip()]
+    return {"records": list(reversed(records)), "count": len(records)}
 
 
 # ---------------------------------------------------------------------------
@@ -1206,6 +1372,13 @@ class GovPlanetScrapeRequest(BaseModel):
     max_results: int = 50
 
 
+class GovDealsScrapeRequest(BaseModel):
+    query: str = ""
+    category: str = "all"
+    max_price: Optional[float] = None
+    max_results: int = 50
+
+
 @app.post("/api/scrape/govplanet")
 def scrape_govplanet_endpoint(req: GovPlanetScrapeRequest):
     from scrapers.govplanet import scrape_govplanet as do_scrape
@@ -1252,6 +1425,52 @@ def scrape_govplanet_endpoint(req: GovPlanetScrapeRequest):
     }
 
 
+@app.post("/api/scrape/govdeals")
+def scrape_govdeals_endpoint(req: GovDealsScrapeRequest):
+    from scrapers.govdeals import scrape_govdeals as do_scrape
+
+    result = do_scrape(
+        query=req.query,
+        category=req.category,
+        max_price=req.max_price,
+        max_results=req.max_results,
+    )
+
+    if result["error"]:
+        return {
+            "success": False,
+            "error": result["error"],
+            "source_url": result["source_url"],
+            "imported": 0,
+            "total_found": 0,
+        }
+
+    imported = 0
+    skipped = 0
+    for listing in result["listings"]:
+        res = process_and_store_listing(listing, "govdeals")
+        if res:
+            imported += 1
+        else:
+            skipped += 1
+
+    import_runs_col.insert_one({
+        "source": "govdeals",
+        "query": req.query,
+        "count": imported,
+        "skipped": skipped,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    return {
+        "success": True,
+        "imported": imported,
+        "skipped": skipped,
+        "total_found": result["total_found"],
+        "source_url": result["source_url"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Available scraper sources info
 # ---------------------------------------------------------------------------
@@ -1260,6 +1479,7 @@ def scrape_govplanet_endpoint(req: GovPlanetScrapeRequest):
 def get_scrapers():
     from scrapers.craigslist import CL_CITIES, CL_CATEGORIES
     from scrapers.govplanet import GP_CATEGORIES
+    from scrapers.govdeals import GD_CATEGORIES
     from scrapers.ebay import EBAY_CATEGORIES, EBAY_APP_ID
     from scrapers.craigslist_rss import CL_CATEGORIES_RSS
     from scrapers.publicsurplus import PS_CATEGORIES
@@ -1283,6 +1503,13 @@ def get_scrapers():
             "status": "available",
             "endpoint": "POST /api/scrape/govplanet",
             "categories": list(GP_CATEGORIES.keys()),
+        },
+        "govdeals": {
+            "name": "GovDeals",
+            "status": "available",
+            "endpoint": "POST /api/scrape/govdeals",
+            "note": "Government auctions with pickup-aware location normalization",
+            "categories": list(GD_CATEGORIES.keys()),
         },
         "ebay": {
             "name": "eBay",
@@ -1528,6 +1755,14 @@ def _rescore_sync() -> dict:
     top_actions, suppressed_count = action_engine.rank_top_actions([
         _serialize_opportunity(doc) for doc in top_docs
     ], top_n=TOP_DEALS_LIMIT)
+    if not top_actions:
+        fallback_docs = [
+            _serialize_opportunity(doc)
+            for doc in scored_opportunities_col.find({"score": {"$gte": 55}})
+            .sort("score", DESCENDING).limit(500)
+        ]
+        top_actions, used_fallback = _select_marketplace_candidates([], fallback_docs)
+        suppressed_count = max(0, len(fallback_docs) - len(top_actions)) if used_fallback else suppressed_count
     if notifier.maybe_alert_top3(top_actions, suppressed_count):
         alerted += 1
 
@@ -1540,6 +1775,21 @@ def _rescore_sync() -> dict:
     emit("top_deals_updated", "rescore", "Top deals updated",
          f"Rescored {rescored} listings, {upserted} opportunities, top {len(top_actions)} actions",
          metadata={"rescored": rescored, "upserted": upserted, "top_actions_count": len(top_actions)})
+
+    # Update canonical host runtime state
+    _ps_refresh_opportunities()
+    _ps_update_system_ts("marketplace_last_run")
+    _ps_append_run({
+        "source":         "rescore",
+        "started_at":     datetime.now(timezone.utc).isoformat(),
+        "duration_ms":    None,
+        "listings_found": rescored,
+        "imported":       upserted,
+        "alerts_sent":    alerted,
+        "drafted":        drafted,
+        "status":         "ok",
+        "error":          None,
+    })
 
     _write_scored_json([{k: v for k, v in d.items() if k != "_id"} for d in top_docs])
     return {
@@ -1642,7 +1892,15 @@ def get_top_actions_brief(
         cached = TOP_ACTIONS_CACHE["top_actions"]
         if not include_examples:
             cached = [a for a in cached if a.get("source") != "seed_data"]
-        cached = [a for a in cached if _local_opportunity_allowed(a)]
+        if not cached:
+            fallback_docs = [
+                _serialize_opportunity(doc)
+                for doc in scored_opportunities_col.find({"score": {"$gte": 55}})
+                .sort("score", DESCENDING).limit(500)
+            ]
+            cached, _ = _select_marketplace_candidates([], fallback_docs)
+        else:
+            cached = [a for a in cached if _local_opportunity_allowed(a)] or cached
         return {
             "top_actions": cached[:limit],
             "count": len(cached[:limit]),
@@ -1658,6 +1916,14 @@ def get_top_actions_brief(
     ranked, suppressed_count = action_engine.rank_top_actions(
         [_serialize_opportunity(doc) for doc in docs], top_n=limit
     )
+    if not ranked:
+        fallback_docs = [
+            _serialize_opportunity(doc)
+            for doc in scored_opportunities_col.find({"score": {"$gte": max(55, min_score - 15)}})
+            .sort("score", DESCENDING).limit(500)
+        ]
+        ranked, used_fallback = _select_marketplace_candidates([], fallback_docs)
+        suppressed_count = max(0, len(fallback_docs) - len(ranked)) if used_fallback else suppressed_count
     return {
         "top_actions": ranked,
         "count": len(ranked),
@@ -1720,6 +1986,15 @@ def get_top_actions(
         [_serialize_opportunity(doc) for doc in docs],
         top_n=limit,
     )
+    if not ranked:
+        fallback_docs = [
+            _serialize_opportunity(doc)
+            for doc in scored_opportunities_col.find({"score": {"$gte": max(55, min_score - 15)}})
+            .sort("score", DESCENDING).limit(500)
+        ]
+        ranked, used_fallback = _select_marketplace_candidates([], fallback_docs)
+        ranked = ranked[:limit]
+        suppressed_count = max(0, len(fallback_docs) - len(ranked)) if used_fallback else suppressed_count
     return {
         "top_actions": ranked,
         "count": len(ranked),
@@ -1898,6 +2173,17 @@ async def _run_craigslist_sched() -> int:
         emit("deals_imported", "craigslist", f"{imported_all} new Craigslist deals",
              f"Imported {imported_all} listings from craigslist ({locations_str})",
              metadata={"source": "craigslist", "count": imported_all})
+    _ps_append_run({
+        "source":         "craigslist",
+        "started_at":     datetime.now(timezone.utc).isoformat(),
+        "duration_ms":    None,
+        "listings_found": total_all,
+        "imported":       imported_all,
+        "alerts_sent":    0,
+        "status":         "ok",
+        "error":          None,
+    })
+    _ps_update_system_ts("marketplace_last_run")
     return imported_all
 
 
@@ -2082,6 +2368,59 @@ async def startup_event():
 # ---------------------------------------------------------------------------
 
 DEAL_STATES_FILE = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "deal_states.json"
+
+
+def _ps_path(name: str) -> Path:
+    return CANONICAL_STATE_DIR / name
+
+
+def _ps_read(name: str, fallback=None):
+    """Read canonical state first, fall back to deprecated legacy pineapple-state read-only path."""
+    primary = _ps_path(name)
+    legacy = LEGACY_PINEAPPLE_STATE_PATH / name
+    for path in (primary, legacy):
+        if not path.exists():
+            continue
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            continue
+    return fallback if fallback is not None else {}
+
+
+def _ps_write(name: str, data) -> None:
+    """Write canonical state only. Legacy pineapple-state is read-only compatibility now."""
+    try:
+        CANONICAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _ps_path(name).write_text(json.dumps(data, indent=2, default=str))
+    except Exception as exc:
+        logger.warning("canonical state write %s failed: %s", name, exc)
+
+
+def _ps_append_run(run_record: dict) -> None:
+    """Append a run record to runs.json, keep last 50."""
+    runs = _ps_read("runs.json", [])
+    if not isinstance(runs, list):
+        runs = []
+    runs.insert(0, run_record)
+    _ps_write("runs.json", runs[:50])
+
+
+def _ps_refresh_opportunities() -> None:
+    """Write current top 10 deals to opportunities.json using operator_console pipeline (correct action scores)."""
+    try:
+        console = build_console_data(scored_opportunities_col)
+        deals = console.get("top_deals", [])[:10]
+        _ps_write("opportunities.json", deals)
+    except Exception as exc:
+        logger.warning("_ps_refresh_opportunities failed: %s", exc)
+
+
+def _ps_update_system_ts(field: str) -> None:
+    """Update a timestamp field in system.json."""
+    sys_data = _ps_read("system.json", {})
+    sys_data[field] = datetime.now(timezone.utc).isoformat()
+    _ps_write("system.json", sys_data)
 
 
 def _save_deal_state(listing_id: str, state: str) -> None:
@@ -2323,3 +2662,84 @@ async def mark_draft_status(listing_id: str, status: str = "sent"):
     if not ok:
         raise HTTPException(status_code=404, detail="Draft not found")
     return {"ok": True, "listing_id": listing_id, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# Pineapple OS — canonical state API
+# ---------------------------------------------------------------------------
+
+@app.get("/pineapple/state")
+async def pineapple_state():
+    """Unified canonical state. Refreshes opportunities from live DB on each call."""
+    await asyncio.to_thread(_ps_refresh_opportunities)
+    return {
+        "system":        _ps_read("system.json",        {}),
+        "opportunities": _ps_read("opportunities.json", []),
+        "approvals":     _ps_read("approvals.json",     []),
+        "alerts":        _ps_read("alerts.json",        []),
+        "tasks":         _ps_read("tasks.json",         []),
+        "agents":        _ps_read("agents.json",        []),
+        "brief":         _ps_read("brief.json",         {}),
+        "runs":          _ps_read("runs.json",          []),
+        "failures":      _ps_read("failures.json",      []),
+    }
+
+
+@app.get("/pineapple/brief")
+async def pineapple_brief():
+    """Return brief.json, refreshed with current top deals."""
+    await asyncio.to_thread(_ps_refresh_opportunities)
+    opps      = _ps_read("opportunities.json", [])
+    approvals = _ps_read("approvals.json", [])
+    system    = _ps_read("system.json", {})
+
+    top3 = []
+    for d in opps[:3]:
+        top3.append({
+            "title":            d.get("title"),
+            "source":           d.get("source"),
+            "price":            d.get("price"),
+            "estimated_profit": d.get("estimated_profit_low") or d.get("estimated_profit"),
+            "action_score":     d.get("action_score"),
+            "cos_action":       d.get("cos_action"),
+            "listing_url":      d.get("listing_url"),
+        })
+
+    pending_count = sum(1 for a in approvals if a.get("status") == "pending")
+    services  = system.get("services", {})
+    up_count  = sum(1 for v in services.values() if v == "up")
+
+    brief = {
+        "generated_at":        datetime.now(timezone.utc).isoformat(),
+        "top3":                top3,
+        "pending_approvals":   pending_count,
+        "system_status":       f"{up_count}/{len(services)} services up",
+        "openclaw_status":     "online" if system.get("openclaw_alive") else "offline",
+        "marketplace_last_run": system.get("marketplace_last_run"),
+        "notes":               [],
+    }
+    _ps_write("brief.json", brief)
+    return brief
+
+
+@app.post("/pineapple/approval/{approval_id}/action")
+async def pineapple_approval_action(approval_id: str, body: dict):
+    """Approve or reject a pending approval. body: {action: 'approve'|'reject', notes: str}"""
+    action = body.get("action")
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+    notes = body.get("notes", "")
+    try:
+        entry = await asyncio.to_thread(approval_manager.resolve_approval, approval_id, action, notes)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"approval {approval_id} not found")
+
+    # If approved send_contact → mark draft as ready_to_send
+    if action == "approve" and entry.get("action_type") == "send_contact":
+        lid = (entry.get("payload") or {}).get("listing_id")
+        if lid:
+            await asyncio.to_thread(mark_draft, lid, "ready_to_send")
+
+    emit("action_triggered", "approval", f"Approval {action}d: {entry.get('title','?')}",
+         f"id={approval_id}", metadata={"approval_id": approval_id, "action": action})
+    return {"ok": True, "approval": entry}
