@@ -11,6 +11,7 @@ import re
 import zipfile
 import hashlib
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -514,6 +515,58 @@ def _select_marketplace_candidates(top_actions: list[dict], fallback_docs: list[
             dedup[key] = item
     ranked = sorted(dedup.values(), key=_candidate_rank_tuple)
     return ranked[:TOP_DEALS_LIMIT], True
+
+
+def _canonical_top_deals(limit: int) -> list[dict]:
+    path = _agency_output_path()
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return []
+
+    deals = payload.get("top_deals")
+    if not isinstance(deals, list):
+        return []
+
+    normalized = []
+    for item in deals:
+        if not isinstance(item, dict):
+            continue
+        normalized_item = dict(item)
+        if "distance" in normalized_item and "distance_miles" not in normalized_item:
+            normalized_item["distance_miles"] = normalized_item.get("distance")
+        if not normalized_item.get("signal_label"):
+            normalized_item["signal_label"] = _signal_label(normalized_item)
+        normalized.append(normalized_item)
+    return normalized[:limit]
+
+
+def _fallback_marketplace_candidates(limit: int, min_score: float) -> tuple[list[dict], int]:
+    canonical = _canonical_top_deals(limit)
+    if canonical:
+        return canonical, 0
+
+    fallback_docs = [
+        _serialize_opportunity(doc)
+        for doc in scored_opportunities_col.find({"score": {"$gte": max(55, min_score - 15)}})
+        .sort("score", DESCENDING).limit(500)
+    ]
+    ranked, used_fallback = _select_marketplace_candidates([], fallback_docs)
+    if ranked:
+        ranked = ranked[:limit]
+        suppressed_count = max(0, len(fallback_docs) - len(ranked)) if used_fallback else 0
+        return ranked, suppressed_count
+
+    listing_fallback_docs = []
+    for doc in listings_col.find().sort("score", DESCENDING).limit(500):
+        listing_fallback_docs.append(_serialize_opportunity(doc))
+    ranked, used_fallback = _select_marketplace_candidates([], listing_fallback_docs)
+    if ranked:
+        ranked = ranked[:limit]
+        suppressed_count = max(0, len(listing_fallback_docs) - len(ranked)) if used_fallback else 0
+        return ranked, suppressed_count
+
+    return [], 0
 
 
 def score_listing(listing: dict) -> dict:
@@ -1041,7 +1094,7 @@ def _classify_ingestion_content(text: str, filename: str, mime_type: str) -> dic
         ("marketplace", ["listing", "resale", "auction", "pickup", "bid", "marketplace"]),
         ("finance", ["invoice", "revenue", "expense", "profit", "bank", "credit"]),
         ("school", ["assignment", "syllabus", "class", "semester", "grade"]),
-        ("ops", ["task", "runbook", "server", "incident", "deployment", "monitor"]),
+        ("ops", ["task", "runbook", "server", "incident", "deployment", "monitor", "checklist"]),
         ("legal", ["agreement", "contract", "terms", "liability", "signature"]),
         ("personal", ["journal", "note", "todo", "reminder"]),
     ]
@@ -1053,12 +1106,37 @@ def _classify_ingestion_content(text: str, filename: str, mime_type: str) -> dic
 
     if filename.lower().endswith(".csv"):
         tags.append("tabular")
+    if filename.lower().endswith((".doc", ".docx", ".rtf")):
+        tags.append("document")
     if mime_type.startswith("text/"):
         tags.append("text")
     elif "zip" in mime_type or filename.lower().endswith(".zip"):
         tags.append("archive")
+    elif mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
+        tags.append("pdf")
 
     return {"kind": kind, "tags": sorted(set(tags))}
+
+
+def _extract_entities(text: str) -> list[str]:
+    candidates = set()
+    for match in re.findall(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}|[A-Z]{2,}(?:\s+[A-Z]{2,})*)\b", text or ""):
+        token = match.strip()
+        if len(token) < 3:
+            continue
+        if token.lower() in {"operations", "incident", "deployment", "checklist", "note"}:
+            continue
+        candidates.add(token)
+    return sorted(candidates)[:15]
+
+
+def _extract_projects(text: str, filename: str) -> list[str]:
+    haystack = f"{filename}\n{text}".lower()
+    projects = []
+    for name in ["pineapple", "marketplace", "openclaw", "dispatch", "trading", "school"]:
+        if name in haystack:
+            projects.append(name)
+    return projects
 
 
 def _write_ingestion_record(record: dict) -> None:
@@ -1070,17 +1148,44 @@ def _write_ingestion_record(record: dict) -> None:
 
 def _extract_pdf_text(raw_path: Path) -> str:
     try:
-        import subprocess
-        result = subprocess.run(
-            ["textutil", "-convert", "txt", "-stdout", str(raw_path)],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(raw_path))
+        pages = [(page.extract_text() or "").strip() for page in reader.pages]
+        text = "\n\n".join(page for page in pages if page)
+        if text.strip():
+            return text
     except Exception:
-        pass
+        logger.exception("Failed to extract PDF text from %s", raw_path)
+    return ""
+
+
+def _extract_docx_text(raw_path: Path) -> str:
+    try:
+        with zipfile.ZipFile(raw_path) as zf:
+            with zf.open("word/document.xml") as fh:
+                root = ET.fromstring(fh.read())
+        paragraphs = []
+        for paragraph in root.findall(".//{*}p"):
+            runs = [node.text for node in paragraph.findall(".//{*}t") if node.text]
+            if runs:
+                paragraphs.append("".join(runs).strip())
+        text = "\n".join(line for line in paragraphs if line)
+        if text.strip():
+            return text
+    except Exception:
+        logger.exception("Failed to extract DOCX text from %s", raw_path)
+    return ""
+
+
+def _extract_document_text(raw_path: Path, filename: str, mime_type: str) -> str:
+    name = (filename or raw_path.name).lower()
+    kind = (mime_type or "").lower()
+
+    if name.endswith(".pdf") or kind == "application/pdf":
+        return _extract_pdf_text(raw_path)
+    if name.endswith(".docx") or kind == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        return _extract_docx_text(raw_path)
     return ""
 
 
@@ -1117,6 +1222,8 @@ def _ingest_text_blob(filename: str, text: str, mime_type: str, source_label: st
         "mime_type": mime_type,
         "stored_text_path": str(extracted_path),
         "classification": classification,
+        "entities": _extract_entities(text),
+        "projects": _extract_projects(text, filename),
         "preview": preview,
         "size_bytes": len(text.encode("utf-8")),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1246,11 +1353,12 @@ async def ingest_file(file: UploadFile = File(...)):
         rows = list(reader)
         normalized = json.dumps(rows[:500], ensure_ascii=False, indent=2)
         records.append(_ingest_text_blob(filename, normalized, mime_type or "text/csv", "csv_upload"))
-    elif filename.lower().endswith(".pdf") or mime_type == "application/pdf":
-        text = _extract_pdf_text(raw_path)
+    elif filename.lower().endswith((".pdf", ".rtf", ".doc", ".docx")) or mime_type in {"application/pdf", "application/rtf", "text/rtf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}:
+        text = _extract_document_text(raw_path, filename, mime_type)
         if not text.strip():
-            raise HTTPException(status_code=422, detail="Could not extract text from PDF")
-        records.append(_ingest_text_blob(filename, text, "application/pdf", "pdf_upload"))
+            raise HTTPException(status_code=422, detail="Could not extract text from document")
+        source_label = "pdf_upload" if filename.lower().endswith(".pdf") or mime_type == "application/pdf" else "document_upload"
+        records.append(_ingest_text_blob(filename, text, mime_type, source_label))
     elif mime_type.startswith("image/") or filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
         text = await _extract_image_text(content, mime_type)
         if not text.strip():
@@ -1277,6 +1385,8 @@ def list_ingestion_records(
     kind: Optional[str] = Query(None),
     tag: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
+    project: Optional[str] = Query(None),
+    entity: Optional[str] = Query(None),
 ):
     index_path = _ingestion_dirs()["index"] / "records.jsonl"
     if not index_path.exists():
@@ -1296,6 +1406,10 @@ def list_ingestion_records(
             or needle in (r.get("preview") or "").lower()
             or needle in ((r.get("classification") or {}).get("kind") or "").lower()
         ]
+    if project:
+        records = [r for r in records if project.lower() in [p.lower() for p in (r.get("projects") or [])]]
+    if entity:
+        records = [r for r in records if entity.lower() in [e.lower() for e in (r.get("entities") or [])]]
 
     records = list(reversed(records[-limit:]))
     return {"records": records, "count": len(records)}
@@ -1955,18 +2069,15 @@ def get_top_actions_brief(
         if not include_examples:
             cached = [a for a in cached if a.get("source") != "seed_data"]
         if not cached:
-            fallback_docs = [
-                _serialize_opportunity(doc)
-                for doc in scored_opportunities_col.find({"score": {"$gte": 55}})
-                .sort("score", DESCENDING).limit(500)
-            ]
-            cached, _ = _select_marketplace_candidates([], fallback_docs)
+            cached, suppressed_count = _fallback_marketplace_candidates(limit, min_score)
         else:
             cached = [a for a in cached if _local_opportunity_allowed(a)] or cached
+            cached = cached[:limit]
+            suppressed_count = TOP_ACTIONS_CACHE.get("suppressed_count", 0)
         return {
-            "top_actions": cached[:limit],
-            "count": len(cached[:limit]),
-            "suppressed_count": TOP_ACTIONS_CACHE.get("suppressed_count", 0),
+            "top_actions": cached,
+            "count": len(cached),
+            "suppressed_count": suppressed_count,
             "cached_at": TOP_ACTIONS_CACHE.get("cached_at"),
             "min_score": min_score,
         }
@@ -1979,13 +2090,9 @@ def get_top_actions_brief(
         [_serialize_opportunity(doc) for doc in docs], top_n=limit
     )
     if not ranked:
-        fallback_docs = [
-            _serialize_opportunity(doc)
-            for doc in scored_opportunities_col.find({"score": {"$gte": max(55, min_score - 15)}})
-            .sort("score", DESCENDING).limit(500)
-        ]
-        ranked, used_fallback = _select_marketplace_candidates([], fallback_docs)
-        suppressed_count = max(0, len(fallback_docs) - len(ranked)) if used_fallback else suppressed_count
+        ranked, suppressed_count = _fallback_marketplace_candidates(limit, min_score)
+    else:
+        ranked = ranked[:limit]
     return {
         "top_actions": ranked,
         "count": len(ranked),
@@ -2049,14 +2156,9 @@ def get_top_actions(
         top_n=limit,
     )
     if not ranked:
-        fallback_docs = [
-            _serialize_opportunity(doc)
-            for doc in scored_opportunities_col.find({"score": {"$gte": max(55, min_score - 15)}})
-            .sort("score", DESCENDING).limit(500)
-        ]
-        ranked, used_fallback = _select_marketplace_candidates([], fallback_docs)
+        ranked, suppressed_count = _fallback_marketplace_candidates(limit, min_score)
+    else:
         ranked = ranked[:limit]
-        suppressed_count = max(0, len(fallback_docs) - len(ranked)) if used_fallback else suppressed_count
     return {
         "top_actions": ranked,
         "count": len(ranked),
