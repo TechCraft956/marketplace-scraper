@@ -25,6 +25,8 @@ services:
       - FAR_OVERRIDE_CATEGORIES=heavy_equipment,equipment,vehicles,motorcycles,cars+trucks
       - LOCAL_FLIPS_MODE=true
       - CRAIGSLIST_LOCATION=mcallen,laredo,corpuschristi,harlingen,brownsville,sfbay
+      - PINEAPPLE_STATE_PATH=/app/pineapple-state
+      - PINEAPPLE_CONTROL_PLANE_DIR=/Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime
     volumes:
       # Cookies for Playwright auth — place fb_cookies.json here before scraping
       - ./data/cookies:/app/cookies
@@ -32,6 +34,8 @@ services:
       - ./data/storage:/app/storage
       # Operator data — contact drafts, deal notes (gitignored)
       - ./operator-data:/app/operator-data
+      # Legacy pineapple-state kept mounted read-only for compatibility only
+      - ./pineapple-state:/app/pineapple-state:ro
       # Host-bound operator runtime outputs
       - /Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime:/Users/DdyFngr/Desktop/Projects/pineapple-ops-runtime
     depends_on:
