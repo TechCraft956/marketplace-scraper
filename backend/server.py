@@ -349,13 +349,48 @@ VERY_HIGH_SCORE_THRESHOLD = 110.0
 HIGH_DEPRIORITIZED_SCORE = 120.0
 STALE_AUCTION_TIME_TO_CASH_DAYS = 10.0
 TOP_DEALS_LIMIT = 3
+LOCATION_TOKEN_COORDS = {
+    "burlingame": (37.5779, -122.3481),
+    "hayward": (37.6688, -122.0808),
+    "castro valley": (37.6941, -122.0864),
+    "san francisco": (37.7749, -122.4194),
+    "oakland": (37.8044, -122.2712),
+    "berkeley": (37.8715, -122.2730),
+    "san jose": (37.3382, -121.8863),
+    "fremont": (37.5483, -121.9886),
+    "pittsburg": (38.0279, -121.8847),
+    "antioch": (38.0049, -121.8058),
+}
 
 
 def _normalize_source(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 
+def _distance_from_home(lat: float, lon: float) -> float:
+    from geo import haversine, HOME_LAT, HOME_LON
+    return haversine(HOME_LAT, HOME_LON, lat, lon)
+
+
+def _apply_location_tokens(listing: dict) -> None:
+    location = (listing.get("location") or "").strip().lower()
+    title = (listing.get("title") or "").strip().lower()
+    haystack = f"{location} {title}"
+    if listing.get("distance_miles") is not None or listing.get("distance") is not None:
+        return
+    for token, coords in LOCATION_TOKEN_COORDS.items():
+        if token in haystack:
+            distance = round(_distance_from_home(*coords), 1)
+            listing["distance_miles"] = distance
+            listing["distance"] = distance
+            listing["travel_tier"] = "local" if distance <= TOP_TIER_LOCAL_DISTANCE else ("stretch" if distance <= STRETCH_LOCAL_DISTANCE else "far")
+            if not listing.get("location"):
+                listing["location"] = token.title()
+            return
+
+
 def _normalized_distance(listing: dict) -> Optional[float]:
+    _apply_location_tokens(listing)
     raw = listing.get("distance_miles")
     if raw is None:
         raw = listing.get("distance")
@@ -395,6 +430,7 @@ def _quality_allowed(listing: dict) -> bool:
         return False
     if len(title.split()) < 3:
         return False
+    _apply_location_tokens(listing)
     lowered = title.lower()
     if lowered in {"n/a", "unknown", "misc", "stuff", "item"}:
         return False
@@ -487,7 +523,9 @@ def _candidate_rank_tuple(listing: dict):
     action_score = float(listing.get("action_score") or 0)
     score = float(listing.get("score") or 0)
     profit = float(listing.get("effective_profit_after_travel") or listing.get("estimated_profit_low") or 0)
-    return (rank, source_penalty, -action_score, -score, distance_sort, -profit)
+    location_bonus = 0 if (listing.get("location") and distance is not None) else 1
+    unknown_travel_penalty = 1 if (listing.get("travel_tier") or "unknown") == "unknown" else 0
+    return (rank, source_penalty, location_bonus, unknown_travel_penalty, -action_score, -score, distance_sort, -profit)
 
 
 def _select_marketplace_candidates(top_actions: list[dict], fallback_docs: list[dict]) -> tuple[list[dict], bool]:

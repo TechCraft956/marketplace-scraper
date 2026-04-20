@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
 ALERT_SCORE_THRESHOLD: float = float(os.environ.get("ALERT_SCORE_THRESHOLD", "70"))
+DEFAULT_MORE_DEALS_LIMIT: int = int(os.environ.get("TOP_ACTIONS_MORE_LIMIT", "12"))
 STORAGE_PATH: Path = Path(os.environ.get("STORAGE_PATH", "/app/storage"))
 ALERTED_IDS_FILE: Path = STORAGE_PATH / "alerted_ids.json"
 TOP3_STATE_FILE: Path = STORAGE_PATH / "top3_alerted_ids.json"
@@ -158,6 +159,36 @@ def format_alert(listing: dict) -> str:
     return "\n".join(lines)
 
 
+def _telegram_api(method: str, payload: dict) -> tuple[bool, dict]:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning(
+            "Telegram not configured — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+            "in docker-compose.yml environment section"
+        )
+        return False, {"description": "telegram_not_configured"}
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode() or "{}")
+            return resp.status == 200 and bool(data.get("ok", True)), data
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        logger.error("Telegram HTTP error %s: %s", e.code, body)
+        try:
+            return False, json.loads(body)
+        except Exception:
+            return False, {"description": body}
+    except Exception as e:
+        logger.error("Telegram send failed: %s", e)
+        return False, {"description": str(e)}
+
+
 def _send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning(
@@ -166,24 +197,13 @@ def _send_telegram(message: str) -> bool:
         )
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({
+    ok, _ = _telegram_api("sendMessage", {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
-    }).encode()
-    req = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except urllib.error.HTTPError as e:
-        logger.error("Telegram HTTP error %s: %s", e.code, e.read().decode())
-    except Exception as e:
-        logger.error("Telegram send failed: %s", e)
-    return False
+    })
+    return ok
 
 
 def maybe_alert(listing: dict, listing_id: str, action_score: float = 0.0) -> bool:
@@ -247,7 +267,7 @@ def _format_top3_move(rank: int, item: dict) -> str:
     return "\n".join(lines)
 
 
-def format_top3_briefing(top_actions: list[dict], suppressed_count: int) -> str:
+def format_top3_briefing(top_actions: list[dict], suppressed_count: int, more_label: str = "Show other deals") -> str:
     """Format the combined operator briefing message."""
     lines = ["🏆 <b>OPERATOR BRIEFING — Top Moves Right Now</b>", ""]
     for item in top_actions:
@@ -255,7 +275,7 @@ def format_top3_briefing(top_actions: list[dict], suppressed_count: int) -> str:
         lines.append(_format_top3_move(rank, item))
         lines.append("")
     if suppressed_count > 0:
-        lines.append(f"⚡ {suppressed_count} other deals tracked. Ask for more to expand the list.")
+        lines.append(f"⚡ {suppressed_count} other deals tracked. Reply \"{more_label}\" to expand the list.")
     return "\n".join(lines)
 
 
@@ -300,6 +320,17 @@ def maybe_alert_top3(top_actions: list[dict], suppressed_count: int = 0) -> bool
 
     message = format_top3_briefing(top_actions, suppressed_count)
     sent = _send_telegram(message)
+
+    if sent and suppressed_count > 0:
+        _telegram_api("sendMessage", {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": "Tap below for more deals.",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "Show other deals", "callback_data": f"more_deals:{DEFAULT_MORE_DEALS_LIMIT}"}
+                ]]
+            }
+        })
 
     if sent:
         alerted_ids.update(lid for lid in current_ids if lid)
