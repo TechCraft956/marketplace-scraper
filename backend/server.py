@@ -1068,6 +1068,38 @@ def _write_ingestion_record(record: dict) -> None:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _extract_pdf_text(raw_path: Path) -> str:
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["textutil", "-convert", "txt", "-stdout", str(raw_path)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+    except Exception:
+        pass
+    return ""
+
+
+async def _extract_image_text(content: bytes, mime_type: str) -> str:
+    try:
+        from scrapers.ocr import extract_with_vision, extract_with_tesseract
+
+        vision_result = await extract_with_vision(content, mime_type)
+        if vision_result:
+            return json.dumps(vision_result, ensure_ascii=False, indent=2)
+
+        tesseract_result = extract_with_tesseract(content)
+        if tesseract_result:
+            return json.dumps(tesseract_result, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return ""
+
+
 def _ingest_text_blob(filename: str, text: str, mime_type: str, source_label: str) -> dict:
     dirs = _ingestion_dirs()
     slug = _ingestion_slug(filename)
@@ -1214,6 +1246,16 @@ async def ingest_file(file: UploadFile = File(...)):
         rows = list(reader)
         normalized = json.dumps(rows[:500], ensure_ascii=False, indent=2)
         records.append(_ingest_text_blob(filename, normalized, mime_type or "text/csv", "csv_upload"))
+    elif filename.lower().endswith(".pdf") or mime_type == "application/pdf":
+        text = _extract_pdf_text(raw_path)
+        if not text.strip():
+            raise HTTPException(status_code=422, detail="Could not extract text from PDF")
+        records.append(_ingest_text_blob(filename, text, "application/pdf", "pdf_upload"))
+    elif mime_type.startswith("image/") or filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        text = await _extract_image_text(content, mime_type)
+        if not text.strip():
+            raise HTTPException(status_code=422, detail="Could not extract text/data from image")
+        records.append(_ingest_text_blob(filename, text, mime_type, "image_upload"))
     else:
         try:
             text = content.decode("utf-8")
@@ -1230,13 +1272,33 @@ async def ingest_file(file: UploadFile = File(...)):
 
 
 @app.get("/api/ingest/records")
-def list_ingestion_records(limit: int = Query(50, ge=1, le=500)):
+def list_ingestion_records(
+    limit: int = Query(50, ge=1, le=500),
+    kind: Optional[str] = Query(None),
+    tag: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+):
     index_path = _ingestion_dirs()["index"] / "records.jsonl"
     if not index_path.exists():
         return {"records": [], "count": 0}
     lines = index_path.read_text(encoding="utf-8").splitlines()
-    records = [json.loads(line) for line in lines[-limit:] if line.strip()]
-    return {"records": list(reversed(records)), "count": len(records)}
+    records = [json.loads(line) for line in lines if line.strip()]
+
+    if kind:
+        records = [r for r in records if (r.get("classification") or {}).get("kind") == kind]
+    if tag:
+        records = [r for r in records if tag in ((r.get("classification") or {}).get("tags") or [])]
+    if q:
+        needle = q.lower()
+        records = [
+            r for r in records
+            if needle in (r.get("filename") or "").lower()
+            or needle in (r.get("preview") or "").lower()
+            or needle in ((r.get("classification") or {}).get("kind") or "").lower()
+        ]
+
+    records = list(reversed(records[-limit:]))
+    return {"records": records, "count": len(records)}
 
 
 # ---------------------------------------------------------------------------
