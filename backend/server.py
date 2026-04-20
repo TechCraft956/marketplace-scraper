@@ -2218,18 +2218,39 @@ def get_more_opportunities(
     if not include_examples:
         query["source"] = {"$ne": "seed_data"}
 
-    docs = [_serialize_opportunity(doc) for doc in scored_opportunities_col.find(query).sort("score", DESCENDING).limit(400) if _local_opportunity_allowed(doc)]
+    docs = [_serialize_opportunity(doc) for doc in scored_opportunities_col.find(query).sort("score", DESCENDING).limit(400)]
     ranked, _ = action_engine.rank_top_actions(docs, top_n=len(docs))
 
+    filtered = []
+    for item in ranked:
+        if not _source_allowed(item):
+            continue
+        if not _quality_allowed(item):
+            continue
+        enriched = dict(item)
+        enriched["signal_label"] = _signal_label(enriched)
+        filtered.append(enriched)
+
     if sort_by == "score":
-        ranked.sort(key=lambda x: x.get("score") or 0, reverse=True)
+        filtered.sort(key=lambda x: x.get("score") or 0, reverse=True)
     elif sort_by == "estimated_profit_low":
-        ranked.sort(key=lambda x: x.get("estimated_profit_low") or 0, reverse=True)
+        filtered.sort(key=lambda x: x.get("estimated_profit_low") or 0, reverse=True)
+    else:
+        filtered.sort(key=_candidate_rank_tuple)
+
+    if not filtered:
+        fallback_docs = [
+            _serialize_opportunity(doc)
+            for doc in scored_opportunities_col.find({"source": {"$ne": "seed_data"}}).sort("score", DESCENDING).limit(500)
+        ]
+        fallback_ranked, _ = _select_marketplace_candidates([], fallback_docs)
+        canonical = _canonical_top_deals(limit)
+        filtered = canonical or fallback_ranked
 
     return {
-        "opportunities": ranked[:limit],
-        "count": min(len(ranked), limit),
-        "total_ranked": len(ranked),
+        "opportunities": filtered[:limit],
+        "count": min(len(filtered), limit),
+        "total_ranked": len(filtered),
         "min_score": min_score,
         "include_examples": include_examples,
         "sort_by": sort_by,
