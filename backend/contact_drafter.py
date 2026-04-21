@@ -149,6 +149,26 @@ def save_draft(listing: dict, listing_id: str) -> dict | None:
     }
     index[listing_id] = entry
     _save_index(index)
+
+    # Create approval request so operator can authorize before sending
+    try:
+        from approvals import create_approval, ACTION_SEND_CONTACT
+        create_approval(
+            action_type=ACTION_SEND_CONTACT,
+            title=f"Send offer to: {entry['title']}",
+            payload={
+                "listing_id":  listing_id,
+                "listing_url": entry["listing_url"],
+                "source":      entry["source"],
+                "price":       price,
+                "offer_price": offer,
+                "draft_text":  draft_text,
+            },
+            owner="contact_drafter",
+        )
+    except Exception as exc:
+        logger.warning("contact_drafter: could not create approval: %s", exc)
+
     return entry
 
 

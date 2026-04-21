@@ -68,7 +68,8 @@ CL_CITIES = {
     "mcallen": "mcallen",
     "laredo": "laredo",
     "corpuschristi": "corpuschristi",
-    "harlingen": "harlingen",
+    # harlingen.craigslist.org does not currently resolve reliably, use brownsville region as resilient fallback
+    "harlingen": "brownsville",
     "brownsville": "brownsville",
 }
 

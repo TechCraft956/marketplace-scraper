@@ -81,6 +81,7 @@ LEGACY_PINEAPPLE_STATE_PATH = Path(os.environ.get("PINEAPPLE_STATE_PATH", "/app/
 TOP_ACTIONS_CACHE: dict = {"top_actions": [], "suppressed_count": 0, "cached_at": None}
 SCRAPE_LOG_PATH  = Path(os.environ.get("STORAGE_PATH", "/app/storage")) / "scrape_log.json"
 FB_COOKIES_PATH  = Path(os.environ.get("FB_COOKIES_PATH", "/app/cookies/fb_cookies.json"))
+TASK_LIFECYCLE_FILE = CANONICAL_STATE_DIR / "task-lifecycle.json"
 
 # Per-source scheduler state (mutated by background tasks at runtime)
 SCHEDULER_STATUS: dict = {
@@ -1593,6 +1594,15 @@ class GovDealsScrapeRequest(BaseModel):
     max_results: int = 50
 
 
+class TaskLifecycleUpdate(BaseModel):
+    status: str
+    resolution: Optional[str] = None
+    actual_outcome: Optional[str] = None
+    was_successful: Optional[bool] = None
+    time_to_complete: Optional[str] = None
+    value_generated: Optional[str] = None
+
+
 @app.post("/api/scrape/govplanet")
 def scrape_govplanet_endpoint(req: GovPlanetScrapeRequest):
     from scrapers.govplanet import scrape_govplanet as do_scrape
@@ -2257,6 +2267,70 @@ def get_more_opportunities(
     }
 
 
+@app.get("/api/operator/task-lifecycle")
+def get_task_lifecycle():
+    generated = [
+        {
+            "task_id": f"generated-approvals-{len([item for item in approval_manager.get_approvals() if item.get('status') == 'pending'])}",
+            "source": "approval",
+            "action": "Review and resolve pending approvals",
+            "reason": f"{len([item for item in approval_manager.get_approvals() if item.get('status') == 'pending'])} approvals are blocking execution",
+            "priority": "high",
+            "expected_outcome": "unblock execution",
+            "confidence": 0.9,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    ]
+    records = []
+    index_path = INGESTION_ROOT / "index" / "records.jsonl"
+    if index_path.exists():
+        for line in index_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
+    if records:
+        latest = records[-1]
+        generated.append({
+            "task_id": f"generated-ingestion-{latest.get('id','latest')}",
+            "source": "ingestion",
+            "action": "Review newly ingested context and convert it into tasks or decisions",
+            "reason": f"New {(latest.get('classification') or {}).get('kind', 'unknown')} context was ingested",
+            "priority": "medium",
+            "expected_outcome": "turn context into action",
+            "confidence": 0.78,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    return _merge_generated_task_lifecycle(generated)
+
+
+@app.put("/api/operator/task-lifecycle/{task_id}")
+def update_task_lifecycle(task_id: str, data: TaskLifecycleUpdate):
+    current = _read_task_lifecycle()
+    tasks = current.get("tasks", [])
+    for idx, task in enumerate(tasks):
+        if task.get("task_id") != task_id:
+            continue
+        task["status"] = data.status
+        task["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if data.resolution is not None:
+            task["resolution"] = data.resolution
+        if data.actual_outcome is not None:
+            task["actual_outcome"] = data.actual_outcome
+        if data.was_successful is not None:
+            task["was_successful"] = data.was_successful
+        if data.time_to_complete is not None:
+            task["time_to_complete"] = data.time_to_complete
+        if data.value_generated is not None:
+            task["value_generated"] = data.value_generated
+        tasks[idx] = task
+        return _write_task_lifecycle(tasks)
+    raise HTTPException(status_code=404, detail="Task lifecycle item not found")
+
+
 # ---------------------------------------------------------------------------
 # Seed data
 # ---------------------------------------------------------------------------
@@ -2618,6 +2692,53 @@ def _ps_write(name: str, data) -> None:
         _ps_path(name).write_text(json.dumps(data, indent=2, default=str))
     except Exception as exc:
         logger.warning("canonical state write %s failed: %s", name, exc)
+
+
+def _read_task_lifecycle() -> dict:
+    return _ps_read("task-lifecycle.json", {"tasks": []})
+
+
+def _write_task_lifecycle(tasks: list[dict]) -> dict:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(tasks),
+        "tasks": tasks,
+    }
+    _ps_write("task-lifecycle.json", payload)
+    return payload
+
+
+def _merge_generated_task_lifecycle(generated_tasks: list[dict]) -> dict:
+    current = _read_task_lifecycle()
+    existing = {item.get("task_id"): item for item in current.get("tasks", []) if item.get("task_id")}
+    merged = []
+    seen = set()
+    now = datetime.now(timezone.utc).isoformat()
+    for task in generated_tasks:
+        task_id = task.get("task_id")
+        prior = existing.get(task_id, {})
+        merged.append({
+            "task_id": task_id,
+            "source": task.get("source"),
+            "action": task.get("action"),
+            "reason": task.get("reason"),
+            "priority": task.get("priority"),
+            "expected_outcome": task.get("expected_outcome"),
+            "confidence": task.get("confidence"),
+            "status": prior.get("status", "pending"),
+            "created_at": prior.get("created_at", task.get("timestamp") or now),
+            "updated_at": now,
+            "resolution": prior.get("resolution"),
+            "actual_outcome": prior.get("actual_outcome"),
+            "was_successful": prior.get("was_successful"),
+            "time_to_complete": prior.get("time_to_complete"),
+            "value_generated": prior.get("value_generated"),
+        })
+        seen.add(task_id)
+    for task_id, prior in existing.items():
+        if task_id not in seen:
+            merged.append(prior)
+    return _write_task_lifecycle(merged)
 
 
 def _ps_append_run(run_record: dict) -> None:
