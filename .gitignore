@@ -45,6 +45,11 @@ fb_cookies.json
 # Operator contact drafts — personal, not for version control
 operator-data/drafts/
 
+# Pineapple OS — runtime state files (not source); refresh.py IS committed
+pineapple-state/
+pineapple-os/
+operator-data/
+
 # Testing
 .pytest_cache/
 .coverage
